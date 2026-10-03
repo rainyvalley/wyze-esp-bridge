@@ -9,7 +9,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 # leave them and enter values on the 3-second console prompt at boot (stored in
 # NVS, survives reboots and OTA updates).
 CONFIG_WYZE_GATEWAY_URI="ws://192.168.1.10:8080/ws/bridge"
+# Deployed values are injected at build time via sdkconfig.local (git-ignored):
+#   CONFIG_WYZE_GATEWAY_URI, CONFIG_WYZE_BRIDGE_TOKEN, CONFIG_WYZE_WIFI_SSID, CONFIG_WYZE_WIFI_PASS
 CONFIG_WYZE_BRIDGE_TOKEN=""
+CONFIG_WYZE_WIFI_SSID=""
+CONFIG_WYZE_WIFI_PASS=""
 # The pairing-dongle's CH9350 front-end needs a longer post-reset settle than
 # the USB 2.0 spec minimum that IDF defaults to; too short and the first root
 # port resets fail on ESP32-P4 (HUB: Root port reset failed spam).

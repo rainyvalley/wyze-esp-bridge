@@ -4,3 +4,5 @@ managed_components/
 sdkconfig
 sdkconfig.old
 *.bin
+sdkconfig.local
+sdkconfig.local.defaults

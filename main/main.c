@@ -76,7 +76,7 @@ static const char *TAG = "wyze-bridge";
 
 // ---------------------------------------------------------------- log ring buffer
 
-#define LOG_BUF_SIZE 16384
+#define LOG_BUF_SIZE 49152
 
 static char s_log[LOG_BUF_SIZE];
 static size_t s_log_head;  // next write position
@@ -116,6 +116,13 @@ typedef struct {
 
 static bridge_config_t s_cfg;
 
+#ifndef CONFIG_WYZE_WIFI_SSID
+#define CONFIG_WYZE_WIFI_SSID ""
+#endif
+#ifndef CONFIG_WYZE_WIFI_PASS
+#define CONFIG_WYZE_WIFI_PASS ""
+#endif
+
 static void nvs_get_str_or(nvs_handle_t h, const char *key, char *out, size_t size, const char *fallback)
 {
     size_t len = size;
@@ -134,8 +141,8 @@ static void config_load(void)
     }
     nvs_get_str_or(h, "uri", s_cfg.uri, sizeof(s_cfg.uri), CONFIG_WYZE_GATEWAY_URI);
     nvs_get_str_or(h, "token", s_cfg.token, sizeof(s_cfg.token), CONFIG_WYZE_BRIDGE_TOKEN);
-    nvs_get_str_or(h, "wifi_ssid", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), "");
-    nvs_get_str_or(h, "wifi_pass", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), "");
+    nvs_get_str_or(h, "wifi_ssid", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), CONFIG_WYZE_WIFI_SSID);
+    nvs_get_str_or(h, "wifi_pass", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), CONFIG_WYZE_WIFI_PASS);
     nvs_close(h);
 }
 
@@ -276,7 +283,8 @@ static void wifi_retry_timer_cb(void *arg)
 static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == ETH_EVENT && id == ETHERNET_EVENT_CONNECTED) {
-        ESP_LOGI(TAG, "ethernet link up");
+        ESP_LOGI(TAG, "ethernet link up (uptime_s=%lld)",
+                 (long long)(esp_timer_get_time() / 1000000));
         xEventGroupSetBits(s_events, ETH_UP_BIT);
 #if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
         if (s_wifi_netif) {
@@ -287,7 +295,12 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         }
 #endif
     } else if (base == ETH_EVENT && id == ETHERNET_EVENT_DISCONNECTED) {
-        ESP_LOGW(TAG, "ethernet link down");
+        // Diagnostics for the periodic ~25.5 min session-kill: prove whether
+        // the link physically drops (PHY EEE/PoE class) vs the TCP dying
+        // inside a healthy link. Uptime+frames pin the cause to this event.
+        ESP_LOGW(TAG, "ethernet link down (uptime_s=%lld frames=%lu/%lu)",
+                 (long long)(esp_timer_get_time() / 1000000),
+                 (unsigned long)s_frames_up, (unsigned long)s_frames_down);
         xEventGroupClearBits(s_events, ETH_UP_BIT | NET_UP_BIT);
 #if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
         if (s_wifi_netif) {

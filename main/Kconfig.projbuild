@@ -13,3 +13,15 @@ menu "Wyze ESP bridge"
             Must match BRIDGE_AUTH_TOKEN on the gateway. Sent as the ?token= query parameter.
 
 endmenu
+
+    config WYZE_WIFI_SSID
+        string "WiFi fallback SSID (baked default)"
+        default ""
+        help
+            Initial value before NVS is populated; console setup also writes it.
+
+    config WYZE_WIFI_PASS
+        string "WiFi fallback password (baked default)"
+        default ""
+        help
+            Initial value before NVS is populated; console setup also writes it.

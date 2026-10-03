@@ -5,6 +5,9 @@ set -e
 mkdir -p out
 build() {  # name target extra-defaults
     defaults="sdkconfig.defaults${3:+;$3}"
+    # Site-specific values (gateway URI/token, WiFi creds) stay out of git:
+    # sdkconfig.local.defaults is appended when present (see .gitignore).
+    [ -f sdkconfig.local.defaults ] && defaults="$defaults;sdkconfig.local.defaults"
     idf.py -B "build-$1" -D SDKCONFIG="build-$1/sdkconfig" -D SDKCONFIG_DEFAULTS="$defaults" set-target "$2" build
     (cd "build-$1" && esptool.py --chip "$2" merge_bin -o "../out/wyze-esp-bridge-$1-merged.bin" @flash_args)
     cp "build-$1/wyze-esp-bridge.bin" "out/wyze-esp-bridge-$1-ota.bin"
