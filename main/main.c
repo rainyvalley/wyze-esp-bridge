@@ -297,13 +297,13 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
             esp_wifi_start();
         }
 #endif
+#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         ESP_LOGI(TAG, "wifi sta starting; connecting to %s", s_cfg.wifi_ssid);
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "wifi disconnected, retrying in 5 s");
         xEventGroupClearBits(s_events, NET_UP_BIT);
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
         esp_timer_stop(s_wifi_retry_timer);
         // MICROSECONDS, not ticks: 5 s retry
         esp_timer_start_once(s_wifi_retry_timer, 5 * 1000000);
