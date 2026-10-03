@@ -8,3 +8,15 @@ dependencies:
   # usb_host_hid 1.0.x declares espressif/usb for all IDF targets except linux,
   # so pinning 1.4.1 (first release with the fix) replaces the in-tree stack.
   espressif/usb: "~1.4.1"
+  # Wi-Fi fallback (P4 only): the board's ESP32-C6 co-processor runs Waveshare's
+  # pre-flashed esp_hosted slave firmware, driven over SDIO. The rules block
+  # (not "dependencies:rules", which is invalid in a component manifest) keeps
+  # the multi-MB hosted stack out of the S3 build (no co-processor there).
+  espressif/esp_wifi_remote:
+    version: "^1.6.5"
+    rules:
+      - if: "target in [esp32p4]"
+  espressif/esp_hosted:
+    version: "^3.0.9"
+    rules:
+      - if: "target in [esp32p4]"
