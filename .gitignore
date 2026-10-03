@@ -1,0 +1,6 @@
+build*/
+out/
+managed_components/
+sdkconfig
+sdkconfig.old
+*.bin

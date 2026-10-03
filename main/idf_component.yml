@@ -1,0 +1,10 @@
+dependencies:
+  idf: ">=5.3"
+  # 1.0.x works with the USB host stack built into ESP-IDF 5.3 (1.1+ pulls in esp-usb's own).
+  espressif/usb_host_hid: "~1.0.3"
+  espressif/esp_websocket_client: "^1.2.0"
+  # ESP-IDF 5.x keeps its buggy built-in usb component (the root-port
+  # disconnect race aborts at hub.c:435, upstream #18366); IDF >=6.0 hides it.
+  # usb_host_hid 1.0.x declares espressif/usb for all IDF targets except linux,
+  # so pinning 1.4.1 (first release with the fix) replaces the in-tree stack.
+  espressif/usb: "~1.4.1"

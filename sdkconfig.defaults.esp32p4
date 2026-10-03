@@ -1,0 +1,5 @@
+# Waveshare ESP32-P4-WIFI6-POE-ETH: ESP32-P4NRW32, 32 MB flash (first 16 MB used), IP101 RMII PHY.
+# Console on UART0 (GPIO37/38) through the USB-C port's CH343. Chip revision v3.x;
+# for v1.x chips build with sdkconfig.defaults.p4-rev1 as well (see build.sh).
+CONFIG_ETH_USE_ESP32_EMAC=y
+CONFIG_ESP32P4_REV_MIN_300=y
