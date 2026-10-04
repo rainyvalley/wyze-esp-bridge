@@ -11,13 +11,17 @@ A [Waveshare ESP32-P4-WIFI6-POE-ETH](https://www.waveshare.com/esp32-p4-wifi6-po
 recommended host ([Amazon US](https://www.amazon.com/dp/B0GFJQSN9B), [Waveshare wiki](https://www.waveshare.com/wiki/ESP32-P4-_WIFI6-POE-ETH)):
 its USB-A port speaks the USB 2.0 host role the dongle needs, its internal Ethernet keeps the link
 wired, and its ESP32-C6 co-processor provides Wi-Fi 6 as an automatic fallback when the cable is
-out. A [Waveshare ESP32-S3-ETH](https://www.waveshare.com/esp32-s3-eth.htm) build is also provided
-(no Wi-Fi fallback there — the S3 board has no co-processor).
+out. The `s3-eth` build targets a cheaper all-wired option: the
+[Waveshare ESP32-S3-ETH PoE board](https://www.waveshare.com/esp32-s3-eth.htm)
+([Amazon US](https://a.co/d/0dSdbcFS)) — W5500 Ethernet, no Wi-Fi fallback (the S3 build has no
+co-processor). An [ESP32-S3-DevKitC-1 N16R8](https://a.co/d/04rXdiuX) is handy for flashing/testing
+the dongle half of the S3 build on a bench (its USB-OTG is the dongle port), but it has no
+Ethernet port.
 
 | Build | Board | Ethernet | Wi-Fi fallback | Dongle port | Console |
 |---|---|---|---|---|---|
-| `p4` / `p4-rev1` | Waveshare **ESP32-P4-WIFI6-POE-ETH** (recommended) | Internal EMAC + IP101 | yes (ESP32-C6 over SDIO) | **USB-A** | USB-C (CH343) |
-| `s3-eth` | Waveshare ESP32-S3-ETH (PoE) | W5500 over SPI | no | USB-C + OTG adapter | Header GPIO43/44 |
+| `p4` / `p4-rev1` | Waveshare **ESP32-P4-WIFI6-POE-ETH** (recommended, [Amazon](https://www.amazon.com/dp/B0GFJQSN9B)) | Internal EMAC + IP101 | yes (ESP32-C6 over SDIO) | **USB-A** | USB-C (CH343) |
+| `s3-eth` | Waveshare ESP32-S3-ETH PoE ([Amazon](https://a.co/d/0dSdbcFS)) | W5500 over SPI | no | USB-C + OTG adapter | Header GPIO43/44 |
 
 **You need a Gateway:** download and run [`HclX/wyzesense2mqtt-rs`](https://github.com/HclX/wyzesense2mqtt-rs)
 on any always-on machine (docs and setup in that repo). This firmware connects to its `/ws/bridge`
