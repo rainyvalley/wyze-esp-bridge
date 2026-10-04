@@ -8,20 +8,24 @@ gateway's desktop `dongle_bridge` binary: it implements the same `/ws/bridge` wi
 the "cable" is a WebSocket.
 
 A [Waveshare ESP32-P4-WIFI6-POE-ETH](https://www.waveshare.com/esp32-p4-wifi6-poe-eth.htm) board is the
-recommended host ([Amazon US](https://www.amazon.com/dp/B0GFJQSN9B), [Waveshare wiki](https://www.waveshare.com/wiki/ESP32-P4-_WIFI6-POE-ETH)):
-its USB-A port speaks the USB 2.0 host role the dongle needs, its internal Ethernet keeps the link
-wired, and its ESP32-C6 co-processor provides Wi-Fi 6 as an automatic fallback when the cable is
-out. The `s3-eth` build targets a cheaper all-wired option: the
-[Waveshare ESP32-S3-ETH PoE board](https://www.waveshare.com/esp32-s3-eth.htm)
-([Amazon US](https://a.co/d/0dSdbcFS)) — W5500 Ethernet, no Wi-Fi fallback (the S3 build has no
-co-processor). An [ESP32-S3-DevKitC-1 N16R8](https://a.co/d/04rXdiuX) is handy for flashing/testing
-the dongle half of the S3 build on a bench (its USB-OTG is the dongle port), but it has no
-Ethernet port.
+recommended host: its USB-A port speaks the USB 2.0 host role the dongle needs, its internal
+Ethernet keeps the link wired, and its ESP32-C6 co-processor provides Wi-Fi as an automatic
+fallback when the cable is out. Waveshare also makes the S3-ETH PoE board
+([wiki](https://www.waveshare.com/esp32-s3-eth.htm)); a plain ESP32-S3-DevKitC-1 is the cheapest
+option and runs the same code Wi-Fi-only. See the matrix below.
 
-| Build | Board | Ethernet | Wi-Fi fallback | Dongle port | Console |
-|---|---|---|---|---|---|
-| `p4` / `p4-rev1` | Waveshare **ESP32-P4-WIFI6-POE-ETH** (recommended, [Amazon](https://www.amazon.com/dp/B0GFJQSN9B)) | Internal EMAC + IP101 | yes (ESP32-C6 over SDIO) | **USB-A** | USB-C (CH343) |
-| `s3-eth` | Waveshare ESP32-S3-ETH PoE ([Amazon](https://a.co/d/0dSdbcFS)) | W5500 over SPI | no | USB-C + OTG adapter | Header GPIO43/44 |
+All three boards run the **same firmware** — pick by connectivity:
+
+| Build | Board | Ethernet | Wi-Fi | Dongle port | Console | Rough price |
+|---|---|---|---|---|---|---|
+| `p4` / `p4-rev1` | Waveshare **ESP32-P4-WIFI6-POE-ETH** — [Amazon](https://www.amazon.com/dp/B0GFJQSN9B) | yes (internal EMAC + IP101) | Wi-Fi 6 fallback (ESP32-C6 over SDIO) | **USB-A** | USB-C (CH343) | ~$25 |
+| `s3-eth` | Waveshare ESP32-S3-ETH PoE — [Amazon](https://a.co/d/0dSdbcFS) | yes (W5500 over SPI) | — | USB-C + OTG adapter | Header GPIO43/44 | ~$30 |
+| `s3-eth` (bare) | ESP32-S3-DevKitC-1 N16R8 — [Amazon](https://a.co/d/04rXdiuX) | — | **Wi-Fi only** (no fallback needed) | USB-C + OTG adapter | USB-C (native) | ~$10 |
+
+The Wi-Fi-only DevKitC row is the cheapest working setup: the firmware's Wi-Fi fallback *becomes*
+the primary network when Ethernet doesn't exist, exactly like the `dongle_bridge`-to-Wi-Fi flow.
+Ethernet-only boards (`s3-eth`) just need the cable in; the P4 adds the automatic failover if the
+cable is out.
 
 **You need a Gateway:** download and run [`HclX/wyzesense2mqtt-rs`](https://github.com/HclX/wyzesense2mqtt-rs)
 on any always-on machine (docs and setup in that repo). This firmware connects to its `/ws/bridge`
