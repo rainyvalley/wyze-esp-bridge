@@ -5,7 +5,11 @@
 //   esp32p4: Waveshare ESP32-P4-WIFI6-POE-ETH. Internal EMAC + IP101 PHY; dongle on the USB-A
 //            port (USB 2.0 HS controller); console on UART0 via the USB-C port's CH343.
 //   esp32s3: Waveshare ESP32-S3-ETH. W5500 SPI Ethernet; dongle on the USB-C port through an OTG
-//            adapter; console on UART0 header pins GPIO43 TX / GPIO44 RX.
+//            adapter; console on UART0 header pins GPIO43 TX / GPIO44 RX. The same image runs
+//            Wi-Fi-only on a bare S3 board (e.g. DevKitC-1): a missing W5500 is not fatal.
+//
+// Network: Ethernet is preferred whenever it has an IP; Wi-Fi (if an SSID is set) covers the
+// gaps and is stopped once Ethernet gets an address. Never both in use at once.
 //
 // Dongle -> gateway: each 64-byte HID input report is [len][len protocol bytes][stale];
 //   only the protocol bytes are forwarded, one binary frame per report.
@@ -40,11 +44,19 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "soc/soc_caps.h"
 #include "usb/hid_host.h"
 #include "usb/usb_host.h"
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
+
+// Wi-Fi: the S3 has its own radio; the P4 drives the board's ESP32-C6 over SDIO (esp_hosted).
+#if (CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED) || SOC_WIFI_SUPPORTED
+#define HAS_WIFI 1
 #include "esp_wifi.h"
+#if CONFIG_ESP_HOSTED
 #include "esp_wifi_remote.h"
+#endif
+#else
+#define HAS_WIFI 0
 #endif
 
 static const char *TAG = "wyze-bridge";
@@ -116,13 +128,6 @@ typedef struct {
 
 static bridge_config_t s_cfg;
 
-#ifndef CONFIG_WYZE_WIFI_SSID
-#define CONFIG_WYZE_WIFI_SSID ""
-#endif
-#ifndef CONFIG_WYZE_WIFI_PASS
-#define CONFIG_WYZE_WIFI_PASS ""
-#endif
-
 static void nvs_get_str_or(nvs_handle_t h, const char *key, char *out, size_t size, const char *fallback)
 {
     size_t len = size;
@@ -133,10 +138,14 @@ static void nvs_get_str_or(nvs_handle_t h, const char *key, char *out, size_t si
 
 static void config_load(void)
 {
+    // Baked defaults first: a fresh flash has no "bridge" namespace yet, and the
+    // baked Wi-Fi credentials are what gets such a board on the network.
+    strlcpy(s_cfg.uri, CONFIG_WYZE_GATEWAY_URI, sizeof(s_cfg.uri));
+    strlcpy(s_cfg.token, CONFIG_WYZE_BRIDGE_TOKEN, sizeof(s_cfg.token));
+    strlcpy(s_cfg.wifi_ssid, CONFIG_WYZE_WIFI_SSID, sizeof(s_cfg.wifi_ssid));
+    strlcpy(s_cfg.wifi_pass, CONFIG_WYZE_WIFI_PASS, sizeof(s_cfg.wifi_pass));
     nvs_handle_t h;
     if (nvs_open("bridge", NVS_READONLY, &h) != ESP_OK) {
-        strlcpy(s_cfg.uri, CONFIG_WYZE_GATEWAY_URI, sizeof(s_cfg.uri));
-        strlcpy(s_cfg.token, CONFIG_WYZE_BRIDGE_TOKEN, sizeof(s_cfg.token));
         return;
     }
     nvs_get_str_or(h, "uri", s_cfg.uri, sizeof(s_cfg.uri), CONFIG_WYZE_GATEWAY_URI);
@@ -224,7 +233,7 @@ static void console_setup(void)
     printf("\n=== wyze-esp-bridge setup (Enter keeps the value in brackets) ===\n");
     prompt("Gateway URI", s_cfg.uri, sizeof(s_cfg.uri), false);
     prompt("Bridge token", s_cfg.token, sizeof(s_cfg.token), true);
-    prompt("WiFi SSID (fallback when no cable, blank = off)", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), false);
+    prompt("WiFi SSID (used when Ethernet has no IP, blank = off)", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), false);
     prompt("WiFi password", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), true);
     if (s_cfg.wifi_ssid[0] == '\0') {
         s_cfg.wifi_pass[0] = '\0';  // no SSID: drop any stale password
@@ -247,8 +256,11 @@ typedef struct {
     hid_host_driver_event_t event;
 } hid_driver_msg_t;
 
-#define NET_UP_BIT BIT0
-#define ETH_UP_BIT BIT1
+#define ETH_LINK_BIT BIT0
+#define ETH_IP_BIT BIT1
+#define WIFI_IP_BIT BIT2
+
+typedef enum { NET_NONE, NET_ETH, NET_WIFI } net_kind_t;
 
 static EventGroupHandle_t s_events;
 static QueueHandle_t s_hid_driver_q;  // new HID devices (driver callback -> app task)
@@ -257,100 +269,118 @@ static QueueHandle_t s_to_dongle_q;   // gateway -> dongle frames
 static volatile hid_host_device_handle_t s_dongle;
 static volatile bool s_dongle_gone;
 static esp_websocket_client_handle_t s_ws;
-static esp_netif_t *s_netif;
-static esp_netif_t *s_wifi_netif;
+static esp_netif_t *s_netif;       // Ethernet; NULL when no Ethernet hardware answered
+static esp_netif_t *s_wifi_netif;  // NULL unless a Wi-Fi SSID is configured
+static bool s_ws_bad_uri;
 static volatile uint32_t s_frames_up, s_frames_down;
 
 // ---------------------------------------------------------------- Ethernet / WiFi
 
-// STA_DISCONNECTED handler: esp_wifi_connect() from a 5 s esp_timer one-shot.
-// The default event loop is shared with lwIP/websocket/USB events; delaying in
-// the handler (vTaskDelay) stalls them all. One-shot (not periodic) and
-// cancelled on every connect attempt so bursts of DISCONNECTED don't stack up.
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
+// Wi-Fi is (re)started from a one-shot esp_timer, never from a delay inside an event
+// handler: the default event loop is shared with lwIP/websocket/USB events. One-shot (not
+// periodic) and restarted on every arm so bursts of DISCONNECTED don't stack up.
+#if HAS_WIFI
+#define WIFI_RETRY_US (5 * 1000000)
+#define WIFI_BOOT_GRACE_US (8 * 1000000)  // let Ethernet link + DHCP first at boot
 static esp_timer_handle_t s_wifi_retry_timer;
+static volatile bool s_wifi_running;  // between STA_START and STA_STOP
+
 static void wifi_retry_timer_cb(void *arg)
 {
-    // Ethernet-first: if the cable came back while we were mid-retry, let the
-    // WLAN rest (the link-down handler starts it again if needed).
-    if (xEventGroupGetBits(s_events) & ETH_UP_BIT) {
+    // Ethernet-first: once it has an address the WLAN rests (link-down restarts it).
+    if (xEventGroupGetBits(s_events) & ETH_IP_BIT) {
         return;
     }
-    esp_wifi_connect();
+    if (s_wifi_running) {
+        esp_wifi_connect();
+    } else {
+        ESP_LOGI(TAG, "starting wifi (ssid: %s, ethernet has no IP)", s_cfg.wifi_ssid);
+        esp_wifi_start();  // STA_START handler connects
+    }
+}
+
+static void wifi_arm(uint64_t delay_us)
+{
+    if (!s_wifi_netif) {
+        return;
+    }
+    esp_timer_stop(s_wifi_retry_timer);
+    esp_timer_start_once(s_wifi_retry_timer, delay_us);  // MICROSECONDS, not ticks
 }
 #endif
 
 static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == ETH_EVENT && id == ETHERNET_EVENT_CONNECTED) {
-        ESP_LOGI(TAG, "ethernet link up (uptime_s=%lld)",
-                 (long long)(esp_timer_get_time() / 1000000));
-        xEventGroupSetBits(s_events, ETH_UP_BIT);
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
-        if (s_wifi_netif) {
-            // Ether-or: WiFi only runs while the cable is out.
-            esp_wifi_stop();
-            xEventGroupClearBits(s_events, NET_UP_BIT);
-            ESP_LOGI(TAG, "wifi fallback stopped (ethernet is primary)");
-        }
-#endif
+        // Wi-Fi keeps carrying traffic until Ethernet actually has an IP: a cable into a
+        // dead port or a switch without DHCP must not take the board offline.
+        ESP_LOGI(TAG, "ethernet link up (uptime_s=%lld)", (long long)(esp_timer_get_time() / 1000000));
+        xEventGroupSetBits(s_events, ETH_LINK_BIT);
     } else if (base == ETH_EVENT && id == ETHERNET_EVENT_DISCONNECTED) {
         // Diagnostics for the periodic ~25.5 min session-kill: prove whether
         // the link physically drops (PHY EEE/PoE class) vs the TCP dying
         // inside a healthy link. Uptime+frames pin the cause to this event.
         ESP_LOGW(TAG, "ethernet link down (uptime_s=%lld frames=%lu/%lu)",
-                 (long long)(esp_timer_get_time() / 1000000),
-                 (unsigned long)s_frames_up, (unsigned long)s_frames_down);
-        xEventGroupClearBits(s_events, ETH_UP_BIT | NET_UP_BIT);
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
-        if (s_wifi_netif) {
-            // If the WLAN was never started (cable present at boot), bring the
-            // fallback up for the first time here.
-            ESP_LOGI(TAG, "starting wifi fallback");
-            esp_wifi_start();
-        }
-#endif
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "wifi sta starting; connecting to %s", s_cfg.wifi_ssid);
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "wifi disconnected, retrying in 5 s");
-        xEventGroupClearBits(s_events, NET_UP_BIT);
-        esp_timer_stop(s_wifi_retry_timer);
-        // MICROSECONDS, not ticks: 5 s retry
-        esp_timer_start_once(s_wifi_retry_timer, 5 * 1000000);
+                 (long long)(esp_timer_get_time() / 1000000), (unsigned long)s_frames_up,
+                 (unsigned long)s_frames_down);
+        xEventGroupClearBits(s_events, ETH_LINK_BIT | ETH_IP_BIT);
+#if HAS_WIFI
+        wifi_arm(1000);
 #endif
     } else if (base == IP_EVENT && id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "network up (ethernet), IP " IPSTR, IP2STR(&ev->ip_info.ip));
-        xEventGroupSetBits(s_events, NET_UP_BIT);
+        xEventGroupSetBits(s_events, ETH_IP_BIT);
         // A new image that gets on the network is kept; otherwise the bootloader rolls back.
         esp_ota_mark_app_valid_cancel_rollback();
-    }
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
-    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        // Ethernet keeps NET_UP_BIT until its link actually drops; WiFi only
-        // fills the gap while the cable is unplugged.
-        if (!(xEventGroupGetBits(s_events) & ETH_UP_BIT)) {
-            ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
-            ESP_LOGW(TAG, "network up (wifi fallback), IP " IPSTR, IP2STR(&ev->ip_info.ip));
-            xEventGroupSetBits(s_events, NET_UP_BIT);
-            esp_ota_mark_app_valid_cancel_rollback();
-        } else {
-            ESP_LOGI(TAG, "wifi fallback got IP, but ethernet is up; ignoring");
+#if HAS_WIFI
+        if (s_wifi_netif) {
+            esp_timer_stop(s_wifi_retry_timer);
+            if (s_wifi_running) {
+                ESP_LOGI(TAG, "wifi stopped (ethernet is primary)");
+                esp_wifi_stop();
+            }
         }
+#endif
+    }
+#if HAS_WIFI
+    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        s_wifi_running = true;
+        ESP_LOGI(TAG, "wifi sta started; connecting to %s", s_cfg.wifi_ssid);
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_STOP) {
+        s_wifi_running = false;
+        xEventGroupClearBits(s_events, WIFI_IP_BIT);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        // Also fires for our own esp_wifi_stop(); only touch the Wi-Fi bit, and only
+        // retry while Ethernet has no address.
+        xEventGroupClearBits(s_events, WIFI_IP_BIT);
+        if (!(xEventGroupGetBits(s_events) & ETH_IP_BIT)) {
+            const wifi_event_sta_disconnected_t *ev = (const wifi_event_sta_disconnected_t *)data;
+            // 202 = auth failed (wrong password), 201/211 = AP not found
+            ESP_LOGW(TAG, "wifi disconnected (reason %d), retrying in 5 s", ev->reason);
+            wifi_arm(WIFI_RETRY_US);
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        if (xEventGroupGetBits(s_events) & ETH_IP_BIT) {
+            ESP_LOGI(TAG, "wifi got IP but ethernet is up; stopping wifi");
+            esp_wifi_stop();
+        } else {
+            ESP_LOGW(TAG, "network up (wifi), IP " IPSTR, IP2STR(&ev->ip_info.ip));
+            xEventGroupSetBits(s_events, WIFI_IP_BIT);
+            esp_ota_mark_app_valid_cancel_rollback();
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
+        xEventGroupClearBits(s_events, WIFI_IP_BIT);
     }
 #endif
 }
 
-static void eth_start(void)
+// Returns false (without aborting) when no Ethernet controller answers, e.g. the
+// s3-eth image on a bare S3 board with no W5500: the board then runs Wi-Fi-only.
+static bool eth_start(void)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
-    s_netif = esp_netif_new(&netif_cfg);
-    esp_netif_set_hostname(s_netif, HOSTNAME);
-
     eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
     eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
 #if CONFIG_IDF_TARGET_ESP32P4
@@ -381,9 +411,22 @@ static void eth_start(void)
     esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500, &mac_cfg);
     esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
 #endif
-    esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth = NULL;
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_cfg, &eth));
+    esp_err_t err = ESP_ERR_NO_MEM;
+    if (mac && phy) {
+        esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
+        err = esp_eth_driver_install(&eth_cfg, &eth);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "no ethernet (%s), wifi only", esp_err_to_name(err));
+        if (mac) {
+            mac->del(mac);
+        }
+        if (phy) {
+            phy->del(phy);
+        }
+        return false;
+    }
 
     // Use the chip's factory Ethernet MAC (the W5500 has none of its own).
     uint8_t addr[6];
@@ -392,53 +435,80 @@ static void eth_start(void)
     ESP_LOGI(TAG, "ethernet MAC %02x:%02x:%02x:%02x:%02x:%02x", addr[0], addr[1], addr[2], addr[3], addr[4],
              addr[5]);
 
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+    s_netif = esp_netif_new(&netif_cfg);
+    esp_netif_set_hostname(s_netif, HOSTNAME);
     ESP_ERROR_CHECK(esp_netif_attach(s_netif, esp_eth_new_netif_glue(eth)));
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, net_event_handler, NULL));
     ESP_ERROR_CHECK(esp_eth_start(eth));
+    return true;
+}
 
-    // WiFi STA fallback (P4 only, via the board's ESP32-C6 co-processor over SDIO).
-    // Connects only when a SSID is configured on the console; used while the
-    // ethernet cable is unplugged. The gateway sees a short reconnect either way.
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
-    if (s_cfg.wifi_ssid[0]) {
-        wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
-        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, net_event_handler, NULL));
-        // esp_netif_create_default_wifi_sta() (not a bare esp_netif_new) also
-        // registers the esp_wifi_default glue that attaches lwIP to the STA
-        // netif on STA events; without that action DHCP replies are dropped
-        // forever ("eh_rx_guard: netif input not attached yet") and no IP.
-        // The hosted port's create_default skips the io-driver binding, which
-        // is what actually installs the wlanif input path; attach it here.
-        s_wifi_netif = esp_netif_create_default_wifi_sta();
-        ESP_ERROR_CHECK(esp_netif_attach_wifi_station(s_wifi_netif));
-        ESP_ERROR_CHECK(esp_netif_set_hostname(s_wifi_netif, HOSTNAME));
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        wifi_config_t sta_cfg = {0};
-        strlcpy((char *)sta_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid));
-        strlcpy((char *)sta_cfg.sta.password, s_cfg.wifi_pass, sizeof(sta_cfg.sta.password));
-        // WPA2/WPA3 default, but never filter harder than the target AP
-        // broadcasts: reason 211 (NO_AP_FOUND_IN_AUTHMODE_THRESHOLD) on
-        // WPA/WPA2-mixed or open networks. Open networks then work too.
-        sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
-        const esp_timer_create_args_t retry_timer_args = {
-            .callback = wifi_retry_timer_cb,
-            .name = "wifi-retry",
-        };
-        ESP_ERROR_CHECK(esp_timer_create(&retry_timer_args, &s_wifi_retry_timer));
-        if (xEventGroupGetBits(s_events) & ETH_UP_BIT) {
-            // Cable already linked: do not power the radio. The link-down
-            // handler starts the fallback if the cable ever drops.
-            ESP_LOGI(TAG, "wifi fallback configured but idle (ethernet is up)");
-        } else {
-            ESP_ERROR_CHECK(esp_wifi_start());
-            ESP_LOGI(TAG, "wifi fallback starting (ssid: %s, no ethernet link)", s_cfg.wifi_ssid);
-        }
+// Wi-Fi STA (only when an SSID is configured): native radio on the S3, the board's
+// ESP32-C6 co-processor over SDIO on the P4.
+static void wifi_init(bool have_eth)
+{
+#if HAS_WIFI
+    if (!s_cfg.wifi_ssid[0]) {
+        return;
     }
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, net_event_handler, NULL));
+    s_wifi_netif = esp_netif_create_default_wifi_sta();
+#if CONFIG_ESP_HOSTED
+    // The hosted port's create_default skips the io-driver binding that installs the
+    // wlanif input path (IDF's native one does it): without this every RX frame is
+    // dropped ("eh_rx_guard: netif input not attached yet") and DHCP never completes.
+    ESP_ERROR_CHECK(esp_netif_attach_wifi_station(s_wifi_netif));
 #endif
+    ESP_ERROR_CHECK(esp_netif_set_hostname(s_wifi_netif, HOSTNAME));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char *)sta_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char *)sta_cfg.sta.password, s_cfg.wifi_pass, sizeof(sta_cfg.sta.password));
+    // Never filter harder than the target AP broadcasts: reason 211
+    // (NO_AP_FOUND_IN_AUTHMODE_THRESHOLD) on WPA/WPA2-mixed or open networks.
+    // The password still enforces at association.
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    const esp_timer_create_args_t retry_timer_args = {
+        .callback = wifi_retry_timer_cb,
+        .name = "wifi-retry",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&retry_timer_args, &s_wifi_retry_timer));
+    if (have_eth) {
+        ESP_LOGI(TAG, "wifi fallback armed (ssid: %s), starts if ethernet has no IP in 8 s", s_cfg.wifi_ssid);
+        wifi_arm(WIFI_BOOT_GRACE_US);
+    } else {
+        ESP_LOGI(TAG, "starting wifi (ssid: %s)", s_cfg.wifi_ssid);
+        ESP_ERROR_CHECK(esp_wifi_start());
+    }
+    // Gateway -> dongle traffic is latency-sensitive and tiny; modem sleep only delays it.
+    esp_wifi_set_ps(WIFI_PS_NONE);
+#else
+    (void)have_eth;
+#endif
+}
+
+static void net_start(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    bool have_eth = eth_start();
+    wifi_init(have_eth);
+    if (!have_eth && !s_wifi_netif) {
+        ESP_LOGE(TAG, "no ethernet and no wifi SSID configured: set one on the console");
+    }
+}
+
+// Ethernet wins whenever it has an address.
+static net_kind_t net_active(void)
+{
+    EventBits_t bits = xEventGroupGetBits(s_events);
+    return (bits & ETH_IP_BIT) ? NET_ETH : (bits & WIFI_IP_BIT) ? NET_WIFI : NET_NONE;
 }
 
 // ---------------------------------------------------------------- USB / HID
@@ -578,8 +648,7 @@ static void open_hid_device(hid_host_device_handle_t handle)
         ESP_LOGE(TAG, "failed to open Wyze dongle");
         return;
     }
-    s_dongle_gone = false;
-    s_dongle = handle;
+    s_dongle = handle;  // s_dongle_gone stays set until the main loop recycles the WebSocket
     ESP_LOGI(TAG, "Wyze dongle up, connecting to gateway");
 }
 
@@ -662,6 +731,12 @@ static void ws_start(void)
     };
     s_rx.len = 0;
     s_ws = esp_websocket_client_init(&cfg);
+    if (!s_ws) {
+        // Only the console (which reboots) changes the URI: don't retry every 500 ms.
+        ESP_LOGE(TAG, "invalid gateway URI \"%s\"; fix it on the console", s_cfg.uri);
+        s_ws_bad_uri = true;
+        return;
+    }
     esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
     esp_websocket_client_start(s_ws);
     ESP_LOGI(TAG, "connecting to %s", s_cfg.uri);
@@ -718,25 +793,24 @@ static bool http_authorized(httpd_req_t *req)
 static esp_err_t status_get(httpd_req_t *req)
 {
     const esp_app_desc_t *app = esp_app_get_description();
+    const net_kind_t net = net_active();
     esp_netif_ip_info_t ip = {0};
-    esp_netif_get_ip_info(s_netif, &ip);
+    if (net != NET_NONE) {
+        esp_netif_get_ip_info(net == NET_ETH ? s_netif : s_wifi_netif, &ip);
+    }
     esp_websocket_client_handle_t ws = s_ws;
-    const bool eth_link = xEventGroupGetBits(s_events) & ETH_UP_BIT;
+    const bool eth_link = xEventGroupGetBits(s_events) & ETH_LINK_BIT;
     char body[768];
     snprintf(body, sizeof(body),
              "{\"board\":\"" BOARD_NAME "\",\"version\":\"%s\",\"built\":\"%s %s\",\"uptime_s\":%lld,\"reset_reason\":%d,"
              "\"ip\":\"" IPSTR "\",\"gateway\":\"%s\",\"dongle\":%s,\"gateway_connected\":%s,"
-             "\"ethernet_link\":%s,\"wifi_fallback\":%s,"
+             "\"network\":\"%s\",\"ethernet_link\":%s,\"wifi_fallback\":%s,"
              "\"frames_to_gateway\":%lu,\"frames_to_dongle\":%lu,\"free_heap\":%lu,\"partition\":\"%s\"}\n",
              app->version, app->date, app->time, esp_timer_get_time() / 1000000, esp_reset_reason(),
              IP2STR(&ip.ip), s_cfg.uri, s_dongle ? "true" : "false",
              (ws && esp_websocket_client_is_connected(ws)) ? "true" : "false",
-             eth_link ? "true" : "false",
-#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED
-             s_cfg.wifi_ssid[0] ? "true" : "false",
-#else
-             "false",
-#endif
+             net == NET_ETH ? "ethernet" : net == NET_WIFI ? "wifi" : "none", eth_link ? "true" : "false",
+             s_wifi_netif ? "true" : "false",
              (unsigned long)s_frames_up,
              (unsigned long)s_frames_down, (unsigned long)esp_get_free_heap_size(),
              esp_ota_get_running_partition()->label);
@@ -888,8 +962,11 @@ void app_main(void)
     s_to_dongle_q = xQueueCreate(16, sizeof(frame_t));
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    eth_start();
+    net_start();
     http_start();
+    if (!s_cfg.token[0]) {
+        ESP_LOGW(TAG, "no bridge token set: /ota and /reboot are open to the whole LAN");
+    }
 
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, xTaskGetCurrentTaskHandle(), 2, NULL, 0);
     ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(1000));
@@ -912,20 +989,28 @@ void app_main(void)
     // is detected via the not-connecting state and torn down so the loop remakes it.
     uint32_t last_frames = UINT32_MAX;
     int wedged_polls = 0;
+    net_kind_t ws_net = NET_NONE;
     while (true) {
         hid_driver_msg_t msg;
         if (xQueueReceive(s_hid_driver_q, &msg, pdMS_TO_TICKS(500)) == pdTRUE &&
             msg.event == HID_HOST_DRIVER_EVENT_CONNECTED) {
             open_hid_device(msg.handle);
         }
-        bool net_up = xEventGroupGetBits(s_events) & NET_UP_BIT;
-        if (s_dongle && net_up && !s_ws) {
-            ws_start();
-            last_frames = UINT32_MAX;
-        } else if ((s_dongle_gone || !s_dongle || !net_up) && s_ws) {
+        const net_kind_t net = net_active();
+        // A dongle that went away (even if already replugged) or a switch between
+        // Ethernet and Wi-Fi ends the session: the gateway must redo its handshake,
+        // and a socket bound to the old interface is dead anyway.
+        bool restart = s_dongle_gone;
+        s_dongle_gone = false;
+        if (s_ws && (restart || !s_dongle || net != ws_net)) {
             ws_stop();
-            s_dongle_gone = false;
-        } else if (s_ws && s_dongle && net_up) {
+        }
+        if (!s_ws && s_dongle && net != NET_NONE && !s_ws_bad_uri) {
+            ws_start();
+            ws_net = net;
+            last_frames = UINT32_MAX;
+            wedged_polls = 0;
+        } else if (s_ws) {
             // Client should be either connected or retrying; both make frame
             // progress or keep the handle busy. If several minutes pass with
             // no frames and no connection, rebuild it from scratch.

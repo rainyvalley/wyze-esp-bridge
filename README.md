@@ -19,13 +19,14 @@ All three boards run the **same firmware** — pick by connectivity:
 | Build | Board | Ethernet | Wi-Fi | Dongle port | Console | Rough price |
 |---|---|---|---|---|---|---|
 | `p4` / `p4-rev1` | Waveshare **ESP32-P4-WIFI6-POE-ETH** — [Amazon](https://www.amazon.com/dp/B0GFJQSN9B) | yes (internal EMAC + IP101) | Wi-Fi 6 fallback (ESP32-C6 over SDIO) | **USB-A** | USB-C (CH343) | ~$25 |
-| `s3-eth` | Waveshare ESP32-S3-ETH PoE — [Amazon](https://a.co/d/0dSdbcFS) | yes (W5500 over SPI) | — | USB-C + OTG adapter | Header GPIO43/44 | ~$30 |
-| `s3-eth` (bare) | ESP32-S3-DevKitC-1 N16R8 — [Amazon](https://a.co/d/04rXdiuX) | — | **Wi-Fi only** (no fallback needed) | USB-C + OTG adapter | USB-C (native) | ~$10 |
+| `s3-eth` | Waveshare ESP32-S3-ETH PoE — [Amazon](https://a.co/d/0dSdbcFS) | yes (W5500 over SPI) | fallback (S3's own radio) | USB-C + OTG adapter | Header GPIO43/44 | ~$30 |
+| `s3-eth` (bare) | ESP32-S3-DevKitC-1 N16R8 — [Amazon](https://a.co/d/04rXdiuX) | — | **Wi-Fi only** | "USB" port + OTG adapter | "UART" USB-C port | ~$10 |
 
-The Wi-Fi-only DevKitC row is the cheapest working setup: the firmware's Wi-Fi fallback *becomes*
-the primary network when Ethernet doesn't exist, exactly like the `dongle_bridge`-to-Wi-Fi flow.
-Ethernet-only boards (`s3-eth`) just need the cable in; the P4 adds the automatic failover if the
-cable is out.
+The Wi-Fi-only DevKitC row is the cheapest working setup: the `s3-eth` image notices there is no
+W5500 (`no ethernet (...), wifi only` in the log) and Wi-Fi *becomes* the primary network. A Wi-Fi
+SSID is mandatory there (console prompt or baked `CONFIG_WYZE_WIFI_SSID`). Make sure the dongle gets
+5 V on the native "USB" port — the DevKitC-1 doesn't necessarily feed VBUS out of that port when
+powered from the "UART" port; a powered OTG hub/Y-cable is the safe option.
 
 **You need a Gateway:** download and run [`HclX/wyzesense2mqtt-rs`](https://github.com/HclX/wyzesense2mqtt-rs)
 on any always-on machine (docs and setup in that repo). This firmware connects to its `/ws/bridge`
@@ -33,13 +34,15 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
 
 ## Network behavior
 
-- **Ethernet is primary.** If a link is present at boot or comes up later, Wi-Fi shuts off
-  (`wifi fallback stopped (ethernet is primary)`).
-- **Wi-Fi is a fallback**, used only while the cable is unplugged or the link is down. It connects
-  5 s after boot when no link, retries forever with a backoff, and shuts off the moment Ethernet
-  returns. Never both at once.
-- The WebSocket stays open only while the dongle is plugged in **and** any network is up; a wedged
+- **Ethernet is primary.** Once it has an IP (not merely a link — a cable into a dead port or a
+  switch without DHCP doesn't count), Wi-Fi shuts off (`wifi stopped (ethernet is primary)`).
+- **Wi-Fi is a fallback** (when an SSID is configured): at boot it starts if Ethernet has no IP
+  within 8 s, starts ~1 s after the link drops, retries every 5 s, and stops when Ethernet has an
+  IP again. Never both in use at once. Boards without Ethernet hardware go straight to Wi-Fi.
+- The WebSocket stays open only while the dongle is plugged in **and** a network is up. Switching
+  between Ethernet and Wi-Fi, or replugging the dongle, recycles the gateway session. A wedged
   WebSocket client is detected and rebuilt (~2 min watchdog).
+- `/status` reports `network` (`ethernet`/`wifi`/`none`) and the IP of the interface in use.
 
 ## Quick start (ESP32-P4)
 
@@ -166,7 +169,7 @@ Every release binary on this repo is built by CI from that exact command.
   benign, Wi-Fi still works.
 - **Boot-loop on older P4 revisions with the dongle pre-powered** — fixed since v2.0.8
   (`root_port_unpowered` at install + power bounce before hub events). Update past that version.
-- **`GET /log` shows only this boot** — it's a 16 KB RAM ring; there is no persistent log.
+- **`GET /log` shows only this boot** — it's a 48 KB RAM ring; there is no persistent log.
 
 ## Acknowledgments
 

@@ -17,7 +17,7 @@ Board variants:
 |---|---|---|
 | `p4` (`build-p4`) | `esp32p4` | chip rev v3.x, internal EMAC + IP101 |
 | `p4-rev1` (`build-p4-rev1`) | `esp32p4` | chip rev v0.x/v1.x; adds `sdkconfig.defaults.p4-rev1` |
-| `s3-eth` (`build-s3-eth`) | `esp32s3` | W5500 SPI Ethernet |
+| `s3-eth` (`build-s3-eth`) | `esp32s3` | W5500 SPI Ethernet + native Wi-Fi fallback; same image runs Wi-Fi-only on a bare DevKitC-1 (missing W5500 is non-fatal) |
 
 The P4 revision split is a hard fork (IDF treats v3.x and v0/v1.x as different hardware): `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` + `CONFIG_ESP32P4_REV_MIN_0=y` for rev1. Check `chip revision:` in the boot log to pick the image.
 
@@ -48,7 +48,7 @@ Notes:
 ## Deploy / verify
 
 - OTA: `POST` the `-ota.bin` to `http://<board-ip>/ota` with `Authorization: Bearer <token>`. Token is `CONFIG_WYZE_BRIDGE_TOKEN` in `sdkconfig.defaults` (must match the gateway's auth). There is no `curl` on this host — use `python3 urllib` (see example in git history of this doc's era: build request with `data=` and Bearer header).
-- `GET /status` and `GET /log` are unauthenticated; `/log` is a 16 KB ring buffer of boot-up-to-now for **this boot only**.
+- `GET /status` and `GET /log` are unauthenticated; `/log` is a 48 KB ring buffer of boot-up-to-now for **this boot only**.
 - Console: P4 board exposes UART0 on the USB-C CH343 (`/dev/ttyACM0`, 115200). S3 needs a header adapter (GPIO43/44) because its USB-C port is the USB *host*.
 - Flash over USB: `pipx run esptool --chip esp32p4 -p /dev/ttyACM0 write_flash 0x0 out/wyze-esp-bridge-p4-rev1-merged.bin` (works with the dongle plugged in; esptool auto-resets into download mode). esptool v5 deprecation warning: the command is now `write-flash`.
 
@@ -71,7 +71,7 @@ Notes:
 6. The 3-second "Press Enter within 3 s" console prompt at boot is the setup dialog (changes gateway URI/token, stored in NVS `bridge` namespace). Pressing Enter or waiting keeps defaults. On a serial line that got garbage this can mis-trigger — harmless (prompt defaults are kept on empty input).
 7. There is **no test suite**; verification is live-device probing: `/status`, `/log`, `pipx run esptool` for raw flashing, and the gateway HTTP API. Log with `TAG "wyze-bridge"`; other tasks log with their own tags (e.g. `HUB` is the usb driver's, `eh_*` are esp-hosted's).
 8. Component version updates go through the ESP component registry during `idf.py reconfigure`; the container has network access. If `managed_components/` was deleted, reconfigure re-fetches.
-9. **Wi-Fi fallback specifics (P4 `CONFIG_ESP_HOSTED` builds).** The Kconfig symbol is `CONFIG_ESP_HOSTED` — `CONFIG_ESP_HOSTED_ENABLED` does not exist and silently breaks the build. Guard macros: `#if CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED`. The managed-component manifest can't use a top-level `rules:` key (only per-dependency version+rules). SDIO wiring needs zero customization on this Waveshare board (slot 1 defaults, pins 18/19/14-17, reset 54 = ESP32-P4-Function-EV-Board-compatible).
-10. **Wi-Fi RX needs an explicit io-driver attach.** The hosted port's `esp_netif_create_default_wifi_sta()` does NOT call `esp_netif_attach_wifi_station()` (IDF's local version does) — without the extra `esp_netif_attach_wifi_station(s_wifi_netif)` call, every incoming frame is dropped by the ESP-Hosted glue with `eh_rx_guard: sta: netif input not attached yet` forever (no DHCP, no IP; association itself looks fine). This cost a whole debugging session in 2.1.2 → 2.1.3.
+9. **Wi-Fi fallback specifics (P4 `CONFIG_ESP_HOSTED` builds).** The Kconfig symbol is `CONFIG_ESP_HOSTED` — `CONFIG_ESP_HOSTED_ENABLED` does not exist and silently breaks the build. Guard macro in main.c: `HAS_WIFI` (= P4+`CONFIG_ESP_HOSTED`, or `SOC_WIFI_SUPPORTED` for the S3's native radio); hosted-only bits use `#if CONFIG_ESP_HOSTED`. The managed-component manifest can't use a top-level `rules:` key (only per-dependency version+rules). SDIO wiring needs zero customization on this Waveshare board (slot 1 defaults, pins 18/19/14-17, reset 54 = ESP32-P4-Function-EV-Board-compatible).
+10. **Wi-Fi RX needs an explicit io-driver attach.** On P4/hosted only (native S3 must NOT double-attach): the hosted port's `esp_netif_create_default_wifi_sta()` does NOT call `esp_netif_attach_wifi_station()` (IDF's local version does) — without the extra `esp_netif_attach_wifi_station(s_wifi_netif)` call, every incoming frame is dropped by the ESP-Hosted glue with `eh_rx_guard: sta: netif input not attached yet` forever (no DHCP, no IP; association itself looks fine). This cost a whole debugging session in 2.1.2 → 2.1.3.
 11. **Wi-Fi disconnect reason 211** (`NO_AP_FOUND_IN_AUTHMODE_THRESHOLD`) means the scan *threshold* filtered the AP out (authmode stricter than AP's advertised suite), NOT a wrong password (that's 202). `threshold.authmode = WIFI_AUTH_OPEN` never filters; the password still enforces at association and open APs work.
 12. The default event loop is shared; event handlers must never `vTaskDelay` (WiFi retries use an esp_timer one-shot instead). OTA over the Wi-Fi fallback works (POST /ota on the WiFi IP); note the board's WiFi IP from the gateway session's `remote_addr` if DNS/hostname lookup fails.
