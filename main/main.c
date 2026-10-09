@@ -328,13 +328,21 @@ static volatile uint32_t s_frames_up, s_frames_down;
 #if HAS_WIFI
 #define WIFI_RETRY_US (5 * 1000000)
 #define WIFI_BOOT_GRACE_US (8 * 1000000)  // let Ethernet link + DHCP first at boot
+#define WIFI_LINKDOWN_US (1 * 1000000)    // Ethernet link or address lost -> start Wi-Fi
+#define WIFI_STOP_US 1000                 // Ethernet is back -> stop Wi-Fi, outside the event loop
 static esp_timer_handle_t s_wifi_retry_timer;
 static volatile bool s_wifi_running;  // between STA_START and STA_STOP
 
 static void wifi_retry_timer_cb(void *arg)
 {
-    // Ethernet-first: once it has an address the WLAN rests (link-down restarts it).
+    // Ethernet-first: once it has an address the WLAN rests (link-down restarts it). The stop
+    // happens here rather than in net_event_handler: on the P4 esp_wifi_stop() is a blocking
+    // RPC to the C6 and must not stall the shared default event loop.
     if (xEventGroupGetBits(s_events) & ETH_IP_BIT) {
+        if (s_wifi_running) {
+            ESP_LOGI(TAG, "wifi stopped (ethernet is primary)");
+            esp_wifi_stop();
+        }
         return;
     }
     if (s_wifi_running) {
@@ -371,7 +379,14 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
                  (unsigned long)s_frames_down);
         xEventGroupClearBits(s_events, ETH_LINK_BIT | ETH_IP_BIT);
 #if HAS_WIFI
-        wifi_arm(1000);
+        wifi_arm(WIFI_LINKDOWN_US);
+#endif
+    } else if (base == IP_EVENT && id == IP_EVENT_ETH_LOST_IP) {
+        // DHCP lease gone with the link still up (e.g. the DHCP server is down).
+        ESP_LOGW(TAG, "ethernet lost its IP");
+        xEventGroupClearBits(s_events, ETH_IP_BIT);
+#if HAS_WIFI
+        wifi_arm(WIFI_LINKDOWN_US);
 #endif
     } else if (base == IP_EVENT && id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
@@ -380,13 +395,7 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         // A new image that gets on the network is kept; otherwise the bootloader rolls back.
         esp_ota_mark_app_valid_cancel_rollback();
 #if HAS_WIFI
-        if (s_wifi_netif) {
-            esp_timer_stop(s_wifi_retry_timer);
-            if (s_wifi_running) {
-                ESP_LOGI(TAG, "wifi stopped (ethernet is primary)");
-                esp_wifi_stop();
-            }
-        }
+        wifi_arm(WIFI_STOP_US);  // replaces any pending start; stops Wi-Fi if it is running
 #endif
     }
 #if HAS_WIFI
@@ -411,7 +420,7 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         if (xEventGroupGetBits(s_events) & ETH_IP_BIT) {
             ESP_LOGI(TAG, "wifi got IP but ethernet is up; stopping wifi");
-            esp_wifi_stop();
+            wifi_arm(WIFI_STOP_US);
         } else {
             ESP_LOGW(TAG, "network up (wifi), IP " IPSTR, IP2STR(&ev->ip_info.ip));
             xEventGroupSetBits(s_events, WIFI_IP_BIT);
@@ -458,7 +467,7 @@ static bool eth_start(void)
     esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
 #endif
     esp_eth_handle_t eth = NULL;
-    esp_err_t err = ESP_ERR_NO_MEM;
+    esp_err_t err = ESP_ERR_NOT_FOUND;  // MAC or PHY driver could not be created
     if (mac && phy) {
         esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
         err = esp_eth_driver_install(&eth_cfg, &eth);
@@ -487,6 +496,7 @@ static bool eth_start(void)
     ESP_ERROR_CHECK(esp_netif_attach(s_netif, esp_eth_new_netif_glue(eth)));
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, net_event_handler, NULL));
     ESP_ERROR_CHECK(esp_eth_start(eth));
     return true;
 }
@@ -499,33 +509,37 @@ static void wifi_init(bool have_eth)
     if (!s_cfg.wifi_ssid[0]) {
         return;
     }
-    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, net_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, net_event_handler, NULL));
-    s_wifi_netif = esp_netif_create_default_wifi_sta();
-#if CONFIG_ESP_HOSTED
-    // The hosted port's create_default skips the io-driver binding that installs the
-    // wlanif input path (IDF's native one does it): without this every RX frame is
-    // dropped ("eh_rx_guard: netif input not attached yet") and DHCP never completes.
-    ESP_ERROR_CHECK(esp_netif_attach_wifi_station(s_wifi_netif));
-#endif
-    ESP_ERROR_CHECK(esp_netif_set_hostname(s_wifi_netif, HOSTNAME));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    wifi_config_t sta_cfg = {0};
-    strlcpy((char *)sta_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid));
-    strlcpy((char *)sta_cfg.sta.password, s_cfg.wifi_pass, sizeof(sta_cfg.sta.password));
-    // Never filter harder than the target AP broadcasts: reason 211
-    // (NO_AP_FOUND_IN_AUTHMODE_THRESHOLD) on WPA/WPA2-mixed or open networks.
-    // The password still enforces at association.
-    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    // The retry timer exists before s_wifi_netif is published: the Ethernet handlers are
+    // already live and only check s_wifi_netif before arming it.
     const esp_timer_create_args_t retry_timer_args = {
         .callback = wifi_retry_timer_cb,
         .name = "wifi-retry",
     };
     ESP_ERROR_CHECK(esp_timer_create(&retry_timer_args, &s_wifi_retry_timer));
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, net_event_handler, NULL));
+    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+#if CONFIG_ESP_HOSTED
+    // The hosted port's create_default skips the io-driver binding that installs the
+    // wlanif input path (IDF's native one does it): without this every RX frame is
+    // dropped ("eh_rx_guard: netif input not attached yet") and DHCP never completes.
+    ESP_ERROR_CHECK(esp_netif_attach_wifi_station(netif));
+#endif
+    ESP_ERROR_CHECK(esp_netif_set_hostname(netif, HOSTNAME));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char *)sta_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char *)sta_cfg.sta.password, s_cfg.wifi_pass, sizeof(sta_cfg.sta.password));
+    // Scan threshold: WPA_PSK is the weakest PSK mode, so WPA/WPA2/WPA3-mixed APs still pass
+    // (a stricter threshold gives reason 211, NO_AP_FOUND_IN_AUTHMODE_THRESHOLD). It must not
+    // be OPEN when a password is set: an open AP spoofing the SSID never asks for the password,
+    // so the station would join it.
+    sta_cfg.sta.threshold.authmode = s_cfg.wifi_pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    s_wifi_netif = netif;
     if (have_eth) {
         ESP_LOGI(TAG, "wifi fallback armed (ssid: %s), starts if ethernet has no IP in 8 s", s_cfg.wifi_ssid);
         wifi_arm(WIFI_BOOT_GRACE_US);
