@@ -208,6 +208,36 @@ static esp_err_t config_save(void)
     return err;
 }
 
+// The public Kconfig default for the gateway URI. A build whose baked URI differs from it carries
+// site settings (sdkconfig.local.defaults).
+#define WYZE_PLACEHOLDER_URI "ws://192.168.1.10:8080/ws/bridge"
+
+// Copies baked site settings into NVS once, when NVS has none yet. Without this, a board that was
+// only ever configured at build time loses its gateway URI/token on the first OTA to a release
+// image, which bakes in the placeholders.
+static void config_seed_nvs(void)
+{
+    if (strcmp(CONFIG_WYZE_GATEWAY_URI, WYZE_PLACEHOLDER_URI) == 0) {
+        return;
+    }
+    nvs_handle_t h;
+    size_t len = 0;
+    bool have_uri = false;
+    if (nvs_open("bridge", NVS_READONLY, &h) == ESP_OK) {
+        have_uri = nvs_get_str(h, "uri", NULL, &len) == ESP_OK;
+        nvs_close(h);
+    }
+    if (have_uri) {
+        return;
+    }
+    esp_err_t err = config_save();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "saved the built-in gateway/Wi-Fi settings to NVS; release OTA images keep them");
+    } else {
+        ESP_LOGW(TAG, "could not save the built-in settings to NVS: %s", esp_err_to_name(err));
+    }
+}
+
 // Setup-dialog input deadline: a prompt left unanswered this long (e.g. it was entered by line
 // noise on a headless board) aborts the dialog and boot continues with the current values.
 #define CONSOLE_IDLE_MS 60000
@@ -1323,6 +1353,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
     config_load();
+    config_seed_nvs();
     console_setup();
 
     s_events = xEventGroupCreate();
