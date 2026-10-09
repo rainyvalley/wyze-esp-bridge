@@ -71,7 +71,7 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
 5. The board boots into `waiting for Wyze dongle`; plug the dongle into the USB-A port (sold with
    your Wyze system, the little USB-A stick), and you'll see:
    ```
-   wyze-esp-bridge 2.3.0 (esp32p4-eth)
+   wyze-esp-bridge 2.4.0 (esp32p4-eth)
    ...
    network up (wifi), IP 192.168.x.x     <- if no ethernet cable
    Wyze dongle up, connecting to gateway
@@ -123,16 +123,57 @@ causes a rollback. An image that never gets an IP is never kept. While an image 
 
 ### OTA updates (once the bridge is online)
 
-```bash
-python3 - <<'EOF'
-import urllib.request
-token = "CHANGE_ME"  # your bridge token
-with open("wyze-esp-bridge-p4-rev1-ota.bin","rb") as f: data = f.read()
-req = urllib.request.Request("http://<board-ip>/ota", data=data, method="POST",
-    headers={"Authorization": f"Bearer {token}"})
-print(urllib.request.urlopen(req, timeout=180).read().decode())
-EOF
-```
+Updates go over the network to `POST /ota`; no USB cable needed after the first flash.
+
+1. **Pick the right image.** Use the same variant you flashed first (see
+   [Firmware variants](#firmware-variants)): `p4` for chip v3.x, `p4-rev1` for v0.x/v1.x, `s3-eth`
+   for the S3 board. A wrong-variant image is rejected by the bridge (`500`) and nothing changes.
+
+2. **Download it and check it.** From the [latest release](https://github.com/rainyvalley/wyze-esp-bridge/releases/latest),
+   grab the `-ota.bin` for your variant and `SHA256SUMS`:
+
+   ```bash
+   V=p4-rev1   # or p4 / s3-eth
+   gh release download -R rainyvalley/wyze-esp-bridge -p "wyze-esp-bridge-$V-ota.bin" -p SHA256SUMS
+   sha256sum --check --ignore-missing SHA256SUMS
+   ```
+
+   (Without `gh`: download the same two files from the release page in a browser.)
+
+3. **Note what's running now,** so you can tell the update took:
+
+   ```bash
+   curl -s http://<board-ip>/status   # "version", "built", "partition"
+   ```
+
+4. **Upload.** Use the bridge token you set on the console (leave the header out if none is set):
+
+   ```bash
+   curl --fail-with-body -H "Authorization: Bearer <token>" \
+        --data-binary @wyze-esp-bridge-$V-ota.bin http://<board-ip>/ota
+   ```
+
+   Takes 10–30 s and answers `ok, rebooting`. The bridge restarts into the other OTA slot.
+
+5. **Check it came back.** After ~20 s (P4: the dongle takes ~16 s to enumerate):
+
+   ```bash
+   curl -s http://<board-ip>/status   # new "version", the other "partition", "gateway_connected": true
+   ```
+
+   The new image is **on trial** until it connects to the gateway (or 5 minutes pass with the
+   network up). `GET /log` shows `new firmware marked valid` once it is kept. Don't reboot or
+   power-cycle it before then: a reset during the trial rolls back to the previous version.
+
+| Response | Meaning |
+|---|---|
+| `ok, rebooting` | Image written and verified; the bridge restarts into it |
+| `401 bad or missing token` | Wrong or missing `Authorization: Bearer` token |
+| `503 … still on trial` | The current image isn't confirmed yet; wait for the gateway to connect (≤5 min) and retry |
+| `400 missing or oversized image` | Empty upload or wrong file (use `-ota.bin`, not `-merged.bin`) |
+| `500 <error>` | Image rejected, e.g. wrong chip variant or corrupt download; the running firmware is untouched |
+
+If the bridge comes back on the old version, the new image was rolled back: check `GET /log`.
 
 HTTP endpoints: `GET /status` (JSON), `GET /log` (this boot's ring buffer), `POST /ota` (token),
 `POST /reboot` (token). Token can also be `?token=` query-param (percent-encoded).
