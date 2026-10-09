@@ -174,7 +174,9 @@ Component versions are locked per target in `dependencies.lock.esp32p4` and
 
 - Dongle → gateway: HID input report `[len][data…]`, forward `data[0..len]` as one binary WS frame.
 - Gateway → dongle: one binary WS frame = one protocol packet, sent as HID
-  `SET_REPORT` (Output, report ID 0) — the dongle has no interrupt OUT endpoint.
+  `SET_REPORT` (Output, report ID 0) — the dongle has no interrupt OUT endpoint. A packet larger
+  than the dongle's output report (read from its HID report descriptor at plug-in and logged as
+  `dongle output report: N bytes`; 64 if the descriptor can't be read) is dropped with a log line.
 - Auth: `?token=<bridge token>` query parameter plus `device=<BOARD_NAME>`, per the gateway's
   [`multi_dongle_design.md`](https://github.com/HclX/wyzesense2mqtt-rs/blob/main/docs/multi_dongle_design.md).
 - The WebSocket stays open only while the dongle is plugged in and the network is up, so the gateway

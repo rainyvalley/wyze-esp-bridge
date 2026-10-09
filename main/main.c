@@ -64,6 +64,8 @@ static const char *TAG = "wyze-bridge";
 
 #define DONGLE_VID 0x1a86
 #define DONGLE_PID 0xe024
+// Input report buffer size, and the output report size assumed when the dongle's report
+// descriptor cannot be read or parsed (see hid_output_report_len).
 #define HID_REPORT_LEN 64
 #define MAX_FRAME 128
 #define CONSOLE_UART UART_NUM_0
@@ -346,6 +348,7 @@ static QueueHandle_t s_to_dongle_q;   // gateway -> dongle frames
 // HID driver cannot tear the device down underneath an in-flight control transfer.
 static SemaphoreHandle_t s_dongle_lock;
 static hid_host_device_handle_t s_dongle;
+static size_t s_dongle_out_len;  // output report size in bytes; larger gateway packets are not sent
 static bool s_dongle_gone;
 // s_ws_lock guards s_ws for tasks other than the main loop (the only writer): it is held across
 // every use of the client from to_gateway_task and the HTTP server, and taken by ws_stop()
@@ -740,6 +743,53 @@ static void usb_lib_task(void *arg)
     }
 }
 
+// Size in bytes of the Output report declared by a HID report descriptor, for a device without
+// report IDs (SET_REPORT goes out with report ID 0). Returns 0 when it can't tell: report IDs,
+// Push/Pop, or a truncated descriptor.
+static size_t hid_output_report_len(const uint8_t *d, size_t n)
+{
+    uint32_t size = 0, count = 0;
+    uint64_t bits = 0;
+    size_t i = 0;
+    while (i < n) {
+        const uint8_t b = d[i];
+        if (b == 0xFE) {  // long item: [0xFE][bDataSize][bLongItemTag][data]
+            if (i + 1 >= n) {
+                return 0;
+            }
+            i += 3 + d[i + 1];
+            continue;
+        }
+        const size_t len = (b & 3) == 3 ? 4 : (b & 3);
+        if (i + 1 + len > n) {
+            return 0;
+        }
+        uint32_t v = 0;
+        for (size_t k = 0; k < len; k++) {
+            v |= (uint32_t)d[i + 1 + k] << (8 * k);
+        }
+        switch (b & 0xFC) {
+        case 0x74:  // Report Size (global)
+            size = v;
+            break;
+        case 0x94:  // Report Count (global)
+            count = v;
+            break;
+        case 0x90:  // Output (main)
+            bits += (uint64_t)size * count;
+            break;
+        case 0x84:  // Report ID
+        case 0xA4:  // Push
+        case 0xB4:  // Pop
+            return 0;
+        default:
+            break;
+        }
+        i += 1 + len;
+    }
+    return bits > 8 * 0xFFFF ? 0xFFFF : (size_t)((bits + 7) / 8);
+}
+
 static void open_hid_device(hid_host_device_handle_t handle)
 {
     hid_host_dev_info_t info;
@@ -766,6 +816,20 @@ static void open_hid_device(hid_host_device_handle_t handle)
         return;
     }
     xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+    // The descriptor read is a control transfer: do it under the lock, like SET_REPORT, so a
+    // disconnect in the middle waits for it (see HID_HOST_INTERFACE_EVENT_DISCONNECTED). Called
+    // only once per device: usb_host_hid 1.0.4 keeps a failed read's buffer and returns it later.
+    size_t desc_len = 0;
+    const uint8_t *desc = hid_host_get_report_descriptor(handle, &desc_len);
+    size_t out_len = desc ? hid_output_report_len(desc, desc_len) : 0;
+    if (out_len == 0) {
+        ESP_LOGW(TAG, "dongle output report size unknown (descriptor %s, %u bytes); assuming %d",
+                 desc ? "not understood" : "unreadable", (unsigned)desc_len, HID_REPORT_LEN);
+        out_len = HID_REPORT_LEN;
+    } else {
+        ESP_LOGI(TAG, "dongle output report: %u bytes", (unsigned)out_len);
+    }
+    s_dongle_out_len = out_len;
     s_dongle = handle;  // s_dongle_gone stays set until the main loop recycles the WebSocket
     xSemaphoreGive(s_dongle_lock);
     ESP_LOGI(TAG, "Wyze dongle up, connecting to gateway");
@@ -781,6 +845,14 @@ static void to_dongle_task(void *arg)
         xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
         if (!s_dongle) {
             xSemaphoreGive(s_dongle_lock);
+            continue;
+        }
+        if (f.len > s_dongle_out_len) {
+            // A SET_REPORT longer than the report can stall the dongle's control pipe.
+            const size_t limit = s_dongle_out_len;
+            xSemaphoreGive(s_dongle_lock);
+            ESP_LOGW(TAG, "gateway packet of %u bytes exceeds the dongle's %u-byte output report; not sent",
+                     f.len, (unsigned)limit);
             continue;
         }
         // Mirrors a Linux hidraw write on a device without an OUT endpoint.
