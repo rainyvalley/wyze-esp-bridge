@@ -159,35 +159,45 @@ static esp_err_t config_save(void)
 {
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open("bridge", NVS_READWRITE, &h), TAG, "nvs_open");
-    nvs_set_str(h, "uri", s_cfg.uri);
-    nvs_set_str(h, "token", s_cfg.token);
-    nvs_set_str(h, "wifi_ssid", s_cfg.wifi_ssid);
-    nvs_set_str(h, "wifi_pass", s_cfg.wifi_pass);
-    esp_err_t err = nvs_commit(h);
+    esp_err_t err = nvs_set_str(h, "uri", s_cfg.uri);
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "token", s_cfg.token);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "wifi_ssid", s_cfg.wifi_ssid);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "wifi_pass", s_cfg.wifi_pass);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
     nvs_close(h);
     return err;
 }
 
-// Reads a line from the console UART. Returns false on timeout before any *printable* input.
-// Non-printable bytes (0x00 etc. from USB-UART line toggles when a terminal attaches
-// mid-boot) must not cancel the setup-prompt timeout: they used to switch the read to
-// an infinite wait, hanging boot until a terminal pressed Enter.
-static bool console_read_line(char *out, size_t size, bool secret, TickType_t first_key_timeout)
+// Setup-dialog input deadline: a prompt left unanswered this long (e.g. it was entered by line
+// noise on a headless board) aborts the dialog and boot continues with the current values.
+#define CONSOLE_IDLE_MS 60000
+
+// Reads a line from the console UART. Returns false if no complete line arrives within
+// idle_timeout of the start or of the last keystroke. Non-printable bytes (0x00 etc. from
+// USB-UART line toggles when a terminal attaches mid-boot) are ignored and do not extend the
+// deadline, so line noise can never hang boot.
+static bool console_read_line(char *out, size_t size, bool secret, TickType_t idle_timeout)
 {
     size_t n = 0;
-    TickType_t timeout = first_key_timeout;
+    TickType_t deadline = xTaskGetTickCount() + idle_timeout;
     while (true) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(deadline - now) <= 0) {
+            out[n] = '\0';
+            return false;
+        }
         uint8_t c;
-        if (uart_read_bytes(CONSOLE_UART, &c, 1, timeout) != 1) {
-            if (n == 0 && timeout != portMAX_DELAY) {
-                return false;
-            }
+        if (uart_read_bytes(CONSOLE_UART, &c, 1, deadline - now) != 1) {
             continue;
         }
-        if (n == 0 && timeout != portMAX_DELAY && !(c >= 0x20 && c < 0x7f) && c != '\r' && c != '\n') {
-            continue;  // ignore line-noise before input starts; keep the deadline
-        }
-        timeout = portMAX_DELAY;
         if (c == '\r' || c == '\n') {
             if (n == 0 && c == '\n') {
                 continue;  // swallow the LF of a CRLF pair
@@ -197,28 +207,55 @@ static bool console_read_line(char *out, size_t size, bool secret, TickType_t fi
         if ((c == 0x08 || c == 0x7f) && n > 0) {
             n--;
             uart_write_bytes(CONSOLE_UART, "\b \b", 3);
-            continue;
-        }
-        if (c >= 0x20 && c < 0x7f && n + 1 < size) {
+        } else if (c >= 0x20 && c < 0x7f && n + 1 < size) {
             out[n++] = (char)c;
             uart_write_bytes(CONSOLE_UART, secret ? "*" : (const char *)&c, 1);
+        } else {
+            continue;
         }
+        deadline = xTaskGetTickCount() + idle_timeout;
     }
     out[n] = '\0';
     uart_write_bytes(CONSOLE_UART, "\r\n", 2);
     return true;
 }
 
-static void prompt(const char *label, char *field, size_t size, bool secret)
+// Waits up to timeout for Enter (CR or LF). Every other byte is ignored, so the boot window
+// stays exactly timeout long whatever arrives on the line.
+static bool console_wait_enter(TickType_t timeout)
+{
+    const TickType_t deadline = xTaskGetTickCount() + timeout;
+    while (true) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(deadline - now) <= 0) {
+            return false;
+        }
+        uint8_t c;
+        if (uart_read_bytes(CONSOLE_UART, &c, 1, deadline - now) == 1 && (c == '\r' || c == '\n')) {
+            return true;
+        }
+    }
+}
+
+// Enter keeps the current value; "-" clears it (when can_clear). Returns false on timeout.
+static bool prompt(const char *label, char *field, size_t size, bool secret, bool can_clear)
 {
     char line[128];
     const char *shown = secret ? (field[0] ? "<unchanged>" : "") : field;
     printf("%s [%s]: ", label, shown);
     fflush(stdout);
-    console_read_line(line, sizeof(line), secret, portMAX_DELAY);
-    if (line[0]) {
-        strlcpy(field, line, size);
+    if (!console_read_line(line, sizeof(line), secret, pdMS_TO_TICKS(CONSOLE_IDLE_MS))) {
+        printf("\nNo input for %d s, setup cancelled (nothing saved).\n", CONSOLE_IDLE_MS / 1000);
+        return false;
     }
+    if (can_clear && strcmp(line, "-") == 0) {
+        field[0] = '\0';
+    } else if (line[0]) {
+        if (strlcpy(field, line, size) >= size) {
+            printf("Warning: truncated to %u characters.\n", (unsigned)(size - 1));
+        }
+    }
+    return true;
 }
 
 // Built-in defaults work as-is, so setup is only offered, never required.
@@ -226,19 +263,28 @@ static void console_setup(void)
 {
     ESP_ERROR_CHECK(uart_driver_install(CONSOLE_UART, 256, 0, 0, NULL, 0));
     printf("\nGateway %s\nPress Enter within 3 s to change settings...\n", s_cfg.uri);
-    char line[8];
-    if (!console_read_line(line, sizeof(line), false, pdMS_TO_TICKS(3000))) {
+    if (!console_wait_enter(pdMS_TO_TICKS(3000))) {
         return;
     }
-    printf("\n=== wyze-esp-bridge setup (Enter keeps the value in brackets) ===\n");
-    prompt("Gateway URI", s_cfg.uri, sizeof(s_cfg.uri), false);
-    prompt("Bridge token", s_cfg.token, sizeof(s_cfg.token), true);
-    prompt("WiFi SSID (used when Ethernet has no IP, blank = off)", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), false);
-    prompt("WiFi password", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), true);
+    const bridge_config_t saved = s_cfg;
+    printf("\n=== wyze-esp-bridge setup (Enter keeps the value in brackets, \"-\" clears it) ===\n");
+    if (!prompt("Gateway URI", s_cfg.uri, sizeof(s_cfg.uri), false, false) ||
+        !prompt("Bridge token", s_cfg.token, sizeof(s_cfg.token), true, true) ||
+        !prompt("WiFi SSID (used when Ethernet has no IP, \"-\" = off)", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid),
+                false, true) ||
+        !prompt("WiFi password", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), true, true)) {
+        s_cfg = saved;
+        return;
+    }
     if (s_cfg.wifi_ssid[0] == '\0') {
         s_cfg.wifi_pass[0] = '\0';  // no SSID: drop any stale password
     }
-    ESP_ERROR_CHECK(config_save());
+    esp_err_t err = config_save();
+    if (err != ESP_OK) {
+        // Keep running with the values entered; they are lost on the next reboot.
+        printf("Saving failed (%s); using the new values until the next reboot.\n", esp_err_to_name(err));
+        return;
+    }
     printf("Saved. Restarting...\n");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
