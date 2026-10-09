@@ -71,7 +71,7 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
 5. The board boots into `waiting for Wyze dongle`; plug the dongle into the USB-A port (sold with
    your Wyze system, the little USB-A stick), and you'll see:
    ```
-   wyze-esp-bridge 2.4.0 (esp32p4-eth)
+   wyze-esp-bridge 2.4.1 (esp32p4-eth)
    ...
    network up (wifi), IP 192.168.x.x     <- if no ethernet cable
    Wyze dongle up, connecting to gateway
@@ -124,6 +124,13 @@ causes a rollback. An image that never gets an IP is never kept. While an image 
 ### OTA updates (once the bridge is online)
 
 Updates go over the network to `POST /ota`; no USB cable needed after the first flash.
+
+**Your settings must be in NVS first.** Release images carry placeholder settings; the gateway URI,
+token and Wi-Fi settings you entered on the console live in NVS and survive updates. If you instead
+built your own image with `sdkconfig.local.defaults`, boot a 2.4.1 or later build of your own once
+before installing a release image: it copies its built-in settings into NVS (the log says `saved the
+built-in gateway/Wi-Fi settings to NVS`). Otherwise the release image boots with the placeholder
+gateway, never connects, and is rolled back only if you reboot it within 5 minutes.
 
 1. **Pick the right image.** Use the same variant you flashed first (see
    [Firmware variants](#firmware-variants)): `p4` for chip v3.x, `p4-rev1` for v0.x/v1.x, `s3-eth`
