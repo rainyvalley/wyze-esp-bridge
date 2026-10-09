@@ -92,9 +92,34 @@ static const char *TAG = "wyze-bridge";
 #define LOG_BUF_SIZE 49152
 
 static char s_log[LOG_BUF_SIZE];
-static size_t s_log_head;  // next write position
-static bool s_log_wrapped;
+static uint64_t s_log_written;  // total bytes ever written; s_log[s_log_written % LOG_BUF_SIZE] is next
 static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Masks the value of every "token=" in a log line. The gateway URI carries the bridge token in
+// its query string, and component code (e.g. the WebSocket client's "Error parse uri = %s")
+// may log that URI; /log is served without auth.
+static bool log_redact_token(char *line)
+{
+    bool redacted = false;
+    for (char *p = strstr(line, "token="); p; p = strstr(p, "token=")) {
+        p += 6;
+        char *end = p;
+        while (*end && *end != '&' && *end != '"' && *end != ' ' && *end != '\r' && *end != '\n') {
+            end++;
+        }
+        if (end - p >= 3) {
+            memmove(p + 3, end, strlen(end) + 1);  // shrinks or keeps the length: never overflows
+            memcpy(p, "***", 3);
+            p += 3;
+            redacted = true;
+        } else if (end > p) {
+            memset(p, '*', end - p);
+            p = end;
+            redacted = true;
+        }
+    }
+    return redacted;
+}
 
 static int log_vprintf(const char *fmt, va_list args)
 {
@@ -103,19 +128,23 @@ static int log_vprintf(const char *fmt, va_list args)
     va_copy(copy, args);
     int n = vsnprintf(line, sizeof(line), fmt, copy);
     va_end(copy);
-    if (n > 0) {
-        size_t len = n < (int)sizeof(line) ? (size_t)n : sizeof(line) - 1;
-        taskENTER_CRITICAL(&s_log_lock);
-        for (size_t i = 0; i < len; i++) {
-            s_log[s_log_head++] = line[i];
-            if (s_log_head == LOG_BUF_SIZE) {
-                s_log_head = 0;
-                s_log_wrapped = true;
-            }
-        }
-        taskEXIT_CRITICAL(&s_log_lock);
+    if (n <= 0) {
+        return vprintf(fmt, args);
     }
-    return vprintf(fmt, args);
+    const bool redacted = log_redact_token(line);
+    const size_t len = strlen(line);
+    taskENTER_CRITICAL(&s_log_lock);
+    size_t idx = s_log_written % LOG_BUF_SIZE;
+    for (size_t i = 0; i < len; i++) {
+        s_log[idx++] = line[i];
+        if (idx == LOG_BUF_SIZE) {
+            idx = 0;
+        }
+    }
+    s_log_written += len;
+    taskEXIT_CRITICAL(&s_log_lock);
+    // Print the redacted copy (possibly truncated) rather than leak the token on the UART too.
+    return redacted ? printf("%s", line) : vprintf(fmt, args);
 }
 
 // ---------------------------------------------------------------- config
@@ -769,7 +798,8 @@ static void to_dongle_task(void *arg)
 
 // ---------------------------------------------------------------- WebSocket
 
-static frame_t s_rx;  // reassembly buffer for fragmented frames (WebSocket task only)
+static frame_t s_rx;     // reassembly buffer for fragmented messages (WebSocket task only)
+static bool s_rx_active;  // inside a binary message: continuation frames (opcode 0) belong to it
 
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -778,26 +808,39 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "gateway connected");
         xQueueReset(s_to_dongle_q);
+        s_rx_active = false;
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "gateway disconnected");
         break;
     case WEBSOCKET_EVENT_DATA:
-        if (ev->op_code != 0x02 && !(ev->op_code == 0x00 && s_rx.len > 0)) {
-            return;  // only binary frames carry protocol data
-        }
-        if (ev->payload_len > MAX_FRAME || ev->payload_offset + ev->data_len > MAX_FRAME) {
-            ESP_LOGW(TAG, "frame too large (%d bytes), dropped", ev->payload_len);
+        // Each WebSocket frame arrives as one or more chunks (payload_offset/data_len within
+        // payload_len); a message is one binary frame plus any continuation frames up to FIN.
+        // Control frames (ping/pong/close) may be interleaved and are skipped here.
+        if (ev->op_code == 0x02 && ev->payload_offset == 0) {
             s_rx.len = 0;
+            s_rx_active = true;
+        } else if (!s_rx_active || (ev->op_code != 0x02 && ev->op_code != 0x00)) {
+            if (ev->op_code == 0x01) {
+                s_rx_active = false;  // a text message: only binary frames carry protocol data
+            }
             return;
         }
-        memcpy(s_rx.data + ev->payload_offset, ev->data_ptr, ev->data_len);
-        s_rx.len = ev->payload_offset + ev->data_len;
-        if (s_rx.len >= ev->payload_len) {
+        if (s_rx.len + ev->data_len > MAX_FRAME) {
+            ESP_LOGW(TAG, "frame too large (> %d bytes), dropped", MAX_FRAME);
+            s_rx_active = false;
+            return;
+        }
+        memcpy(s_rx.data + s_rx.len, ev->data_ptr, ev->data_len);
+        s_rx.len += ev->data_len;
+        if (ev->fin && ev->payload_offset + ev->data_len >= ev->payload_len) {
+            s_rx_active = false;
+            if (s_rx.len == 0) {
+                return;  // an empty message is not a protocol packet
+            }
             if (xQueueSend(s_to_dongle_q, &s_rx, pdMS_TO_TICKS(100)) != pdTRUE) {
                 ESP_LOGW(TAG, "dongle queue full, dropped frame");
             }
-            s_rx.len = 0;
         }
         break;
     case WEBSOCKET_EVENT_ERROR:
@@ -808,12 +851,39 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     }
 }
 
+// Percent-encodes src for a URI query value (RFC 3986 unreserved characters pass through, so
+// typical alphanumeric tokens are sent unchanged). Returns false if out is too small.
+static bool url_encode(char *out, size_t size, const char *src)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t n = 0;
+    for (; *src; src++) {
+        const unsigned char c = (unsigned char)*src;
+        const bool plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                           c == '-' || c == '.' || c == '_' || c == '~';
+        if (n + (plain ? 1 : 3) >= size) {
+            return false;
+        }
+        if (plain) {
+            out[n++] = c;
+        } else {
+            out[n++] = '%';
+            out[n++] = hex[c >> 4];
+            out[n++] = hex[c & 0xF];
+        }
+    }
+    out[n] = '\0';
+    return true;
+}
+
 static void ws_start(void)
 {
-    static char uri[256];
+    static char uri[sizeof(s_cfg.uri) + 3 * (sizeof(s_cfg.token) - 1) + 48];
     const char *sep = strchr(s_cfg.uri, '?') ? "&" : "?";
     if (s_cfg.token[0]) {
-        snprintf(uri, sizeof(uri), "%s%sdevice=" BOARD_NAME "&token=%s", s_cfg.uri, sep, s_cfg.token);
+        char token[3 * (sizeof(s_cfg.token) - 1) + 1];
+        url_encode(token, sizeof(token), s_cfg.token);  // sized for the worst case: cannot fail
+        snprintf(uri, sizeof(uri), "%s%sdevice=" BOARD_NAME "&token=%s", s_cfg.uri, sep, token);
     } else {
         snprintf(uri, sizeof(uri), "%s%sdevice=" BOARD_NAME, s_cfg.uri, sep);
     }
@@ -824,15 +894,19 @@ static void ws_start(void)
         .buffer_size = 1024,
     };
     s_rx.len = 0;
-    s_ws = esp_websocket_client_init(&cfg);
-    if (!s_ws) {
+    s_rx_active = false;
+    esp_websocket_client_handle_t ws = esp_websocket_client_init(&cfg);
+    if (!ws) {
         // Only the console (which reboots) changes the URI: don't retry every 500 ms.
         ESP_LOGE(TAG, "invalid gateway URI \"%s\"; fix it on the console", s_cfg.uri);
         s_ws_bad_uri = true;
         return;
     }
-    esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
-    esp_websocket_client_start(s_ws);
+    esp_websocket_register_events(ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
+    esp_websocket_client_start(ws);
+    xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+    s_ws = ws;
+    xSemaphoreGive(s_ws_lock);
     ESP_LOGI(TAG, "connecting to %s", s_cfg.uri);
 }
 
@@ -841,9 +915,14 @@ static void ws_stop(void)
     if (!s_ws) {
         return;
     }
-    esp_websocket_client_stop(s_ws);
-    esp_websocket_client_destroy(s_ws);
+    // Unpublish under the lock: once it is held no other task is using the client, and
+    // afterwards none can pick it up, so destroying it outside the lock is safe.
+    xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+    esp_websocket_client_handle_t ws = s_ws;
     s_ws = NULL;
+    xSemaphoreGive(s_ws_lock);
+    esp_websocket_client_stop(ws);
+    esp_websocket_client_destroy(ws);
     ESP_LOGI(TAG, "gateway connection closed");
 }
 
@@ -854,34 +933,91 @@ static void to_gateway_task(void *arg)
         if (xQueueReceive(s_to_gateway_q, &f, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        esp_websocket_client_handle_t ws = s_ws;
-        if (ws && esp_websocket_client_is_connected(ws)) {
-            if (esp_websocket_client_send_bin(ws, (const char *)f.data, f.len, pdMS_TO_TICKS(1000)) < 0) {
+        xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+        if (s_ws && esp_websocket_client_is_connected(s_ws)) {
+            if (esp_websocket_client_send_bin(s_ws, (const char *)f.data, f.len, pdMS_TO_TICKS(1000)) < 0) {
                 ESP_LOGW(TAG, "send to gateway failed");
             } else {
                 s_frames_up++;
             }
         }
+        xSemaphoreGive(s_ws_lock);
     }
 }
 
 // ---------------------------------------------------------------- HTTP: status, log, OTA
 
+// Compares without an early exit, so the time taken does not reveal how much of a guess matched.
+static bool token_equal(const char *given, const char *token)
+{
+    const size_t n = strlen(token);
+    const size_t m = strlen(given);
+    unsigned char diff = m != n;
+    for (size_t i = 0; i < n; i++) {
+        diff |= (unsigned char)((i < m ? given[i] : 0) ^ token[i]);
+    }
+    return diff == 0;
+}
+
+// Decodes %XX and '+' in a query value in place.
+static void url_decode(char *s)
+{
+    char *out = s;
+    for (; *s; s++) {
+        int hi, lo;
+        if (*s == '%' && sscanf(s + 1, "%1x%1x", &hi, &lo) == 2) {
+            *out++ = (char)(hi << 4 | lo);
+            s += 2;
+        } else {
+            *out++ = *s == '+' ? ' ' : *s;
+        }
+    }
+    *out = '\0';
+}
+
 // Accepts the bridge token as "Authorization: Bearer <token>" or ?token=<token>.
 static bool http_authorized(httpd_req_t *req)
 {
     if (!s_cfg.token[0]) {
+        // Open by default so a fresh flash can be updated before a token is set; builds with
+        // CONFIG_WYZE_REQUIRE_TOKEN refuse instead.
+#if CONFIG_WYZE_REQUIRE_TOKEN
+        return false;
+#else
         return true;
+#endif
     }
     char buf[96];
     if (httpd_req_get_hdr_value_str(req, "Authorization", buf, sizeof(buf)) == ESP_OK &&
-        strncmp(buf, "Bearer ", 7) == 0 && strcmp(buf + 7, s_cfg.token) == 0) {
+        strncmp(buf, "Bearer ", 7) == 0 && token_equal(buf + 7, s_cfg.token)) {
         return true;
     }
-    char query[128];
-    char token[72];
-    return httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-           httpd_query_key_value(query, "token", token, sizeof(token)) == ESP_OK && strcmp(token, s_cfg.token) == 0;
+    char query[256];
+    char token[200];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "token", token, sizeof(token)) != ESP_OK) {
+        return false;
+    }
+    url_decode(token);
+    return token_equal(token, s_cfg.token);
+}
+
+// Writes src as the contents of a JSON string (without quotes), truncating to fit.
+static void json_escape(char *out, size_t size, const char *src)
+{
+    size_t n = 0;
+    for (; *src && n + 7 < size; src++) {
+        const unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') {
+            out[n++] = '\\';
+            out[n++] = c;
+        } else if (c < 0x20) {
+            n += snprintf(out + n, size - n, "\\u%04x", c);
+        } else {
+            out[n++] = c;
+        }
+    }
+    out[n] = '\0';
 }
 
 static esp_err_t status_get(httpd_req_t *req)
@@ -892,17 +1028,20 @@ static esp_err_t status_get(httpd_req_t *req)
     if (net != NET_NONE) {
         esp_netif_get_ip_info(net == NET_ETH ? s_netif : s_wifi_netif, &ip);
     }
-    esp_websocket_client_handle_t ws = s_ws;
+    xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+    const bool ws_connected = s_ws && esp_websocket_client_is_connected(s_ws);
+    xSemaphoreGive(s_ws_lock);
     const bool eth_link = xEventGroupGetBits(s_events) & ETH_LINK_BIT;
-    char body[768];
+    char uri[2 * sizeof(s_cfg.uri)];
+    json_escape(uri, sizeof(uri), s_cfg.uri);
+    char body[1024];
     snprintf(body, sizeof(body),
              "{\"board\":\"" BOARD_NAME "\",\"version\":\"%s\",\"built\":\"%s %s\",\"uptime_s\":%lld,\"reset_reason\":%d,"
              "\"ip\":\"" IPSTR "\",\"gateway\":\"%s\",\"dongle\":%s,\"gateway_connected\":%s,"
              "\"network\":\"%s\",\"ethernet_link\":%s,\"wifi_fallback\":%s,"
              "\"frames_to_gateway\":%lu,\"frames_to_dongle\":%lu,\"free_heap\":%lu,\"partition\":\"%s\"}\n",
              app->version, app->date, app->time, esp_timer_get_time() / 1000000, esp_reset_reason(),
-             IP2STR(&ip.ip), s_cfg.uri, s_dongle ? "true" : "false",
-             (ws && esp_websocket_client_is_connected(ws)) ? "true" : "false",
+             IP2STR(&ip.ip), uri, s_dongle ? "true" : "false", ws_connected ? "true" : "false",
              net == NET_ETH ? "ethernet" : net == NET_WIFI ? "wifi" : "none", eth_link ? "true" : "false",
              s_wifi_netif ? "true" : "false",
              (unsigned long)s_frames_up,
@@ -914,27 +1053,30 @@ static esp_err_t status_get(httpd_req_t *req)
 
 static esp_err_t log_get(httpd_req_t *req)
 {
-    // Copy out under the lock, then send without holding it.
-    char *copy = malloc(LOG_BUF_SIZE);
-    if (!copy) {
-        return httpd_resp_send_500(req);
-    }
-    size_t len;
+    // Streamed in small chunks, each copied under the (interrupt-masking) spinlock and sent
+    // without it: no 48 KB allocation and no long critical section. Text that is overwritten
+    // while the response is being sent is skipped, never sent garbled.
+    char chunk[512];
     taskENTER_CRITICAL(&s_log_lock);
-    if (s_log_wrapped) {
-        size_t tail = LOG_BUF_SIZE - s_log_head;
-        memcpy(copy, s_log + s_log_head, tail);
-        memcpy(copy + tail, s_log, s_log_head);
-        len = LOG_BUF_SIZE;
-    } else {
-        memcpy(copy, s_log, s_log_head);
-        len = s_log_head;
-    }
+    const uint64_t end = s_log_written;
     taskEXIT_CRITICAL(&s_log_lock);
+    uint64_t pos = end > LOG_BUF_SIZE ? end - LOG_BUF_SIZE : 0;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    esp_err_t err = httpd_resp_send(req, copy, len);
-    free(copy);
-    return err;
+    while (pos < end) {
+        size_t n = 0;
+        taskENTER_CRITICAL(&s_log_lock);
+        if (s_log_written - pos > LOG_BUF_SIZE) {
+            pos = s_log_written - LOG_BUF_SIZE;  // the writer lapped us
+        }
+        while (pos < end && n < sizeof(chunk)) {
+            chunk[n++] = s_log[pos++ % LOG_BUF_SIZE];
+        }
+        taskEXIT_CRITICAL(&s_log_lock);
+        if (n > 0 && httpd_resp_send_chunk(req, chunk, n) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static void restart_task(void *arg)
@@ -966,12 +1108,13 @@ static esp_err_t ota_post(httpd_req_t *req)
     while (buf && remaining > 0) {
         int n = httpd_req_recv(req, buf, remaining < 4096 ? remaining : 4096);
         if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 3) {
-            continue;
+            continue;  // three timeouts in a row abort the upload
         }
         if (n <= 0) {
             err = ESP_FAIL;
             break;
         }
+        timeouts = 0;
         if (first && (uint8_t)buf[0] != 0xE9) {  // app images start with ESP_IMAGE_HEADER_MAGIC
             err = ESP_ERR_INVALID_ARG;
             break;
@@ -1020,6 +1163,8 @@ static void http_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 6144;
     cfg.recv_wait_timeout = 10;
+    // Idle or slow clients cannot hold every socket: the least recently used one is closed.
+    cfg.lru_purge_enable = true;
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &cfg));
     const httpd_uri_t routes[] = {
@@ -1061,7 +1206,11 @@ void app_main(void)
     net_start();
     http_start();
     if (!s_cfg.token[0]) {
+#if CONFIG_WYZE_REQUIRE_TOKEN
+        ESP_LOGW(TAG, "no bridge token set: /ota and /reboot are disabled until one is set on the console");
+#else
         ESP_LOGW(TAG, "no bridge token set: /ota and /reboot are open to the whole LAN");
+#endif
     }
 
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, xTaskGetCurrentTaskHandle(), 2, NULL, 0);
