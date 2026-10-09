@@ -41,6 +41,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -312,8 +313,15 @@ static EventGroupHandle_t s_events;
 static QueueHandle_t s_hid_driver_q;  // new HID devices (driver callback -> app task)
 static QueueHandle_t s_to_gateway_q;  // dongle -> gateway frames
 static QueueHandle_t s_to_dongle_q;   // gateway -> dongle frames
-static volatile hid_host_device_handle_t s_dongle;
-static volatile bool s_dongle_gone;
+// s_dongle_lock guards s_dongle and s_dongle_gone, and is held across every SET_REPORT so the
+// HID driver cannot tear the device down underneath an in-flight control transfer.
+static SemaphoreHandle_t s_dongle_lock;
+static hid_host_device_handle_t s_dongle;
+static bool s_dongle_gone;
+// s_ws_lock guards s_ws for tasks other than the main loop (the only writer): it is held across
+// every use of the client from to_gateway_task and the HTTP server, and taken by ws_stop()
+// before the client is destroyed.
+static SemaphoreHandle_t s_ws_lock;
 static esp_websocket_client_handle_t s_ws;
 static esp_netif_t *s_netif;       // Ethernet; NULL when no Ethernet hardware answered
 static esp_netif_t *s_wifi_netif;  // NULL unless a Wi-Fi SSID is configured
@@ -582,6 +590,7 @@ static net_kind_t net_active(void)
 //  - fire late (+8 s after power-on) so the port is in a settled state,
 //    past debounce + reset + recovery, before we touch power again
 //  - skip entirely once the dongle is up
+#if CONFIG_IDF_TARGET_ESP32P4
 static void usb_replug_timer_cb(void *arg)
 {
     if (s_dongle) {
@@ -590,10 +599,16 @@ static void usb_replug_timer_cb(void *arg)
     ESP_LOGI(TAG, "dongle still absent, emulating one replug");
     if (usb_host_lib_set_root_port_power(false) == ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(200));
-        usb_host_lib_set_root_port_power(true);
-        ESP_LOGI(TAG, "root port power bounced (dongle not up)");
+        esp_err_t err = usb_host_lib_set_root_port_power(true);
+        if (err != ESP_OK) {
+            // No retry (see the rules above): the port stays unpowered until a reboot.
+            ESP_LOGE(TAG, "root port power-on failed (%s); dongle needs a reboot", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "root port power bounced (dongle not up)");
+        }
     }
 }
+#endif
 
 static void hid_interface_cb(hid_host_device_handle_t handle, const hid_host_interface_event_t event, void *arg)
 {
@@ -627,10 +642,16 @@ static void hid_interface_cb(hid_host_device_handle_t handle, const hid_host_int
     }
     case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Wyze dongle disconnected");
+        // Waits for an in-flight SET_REPORT in to_dongle_task. The driver frees the device
+        // after this callback returns, so the transfer must be finished by then. (Its
+        // completion is delivered by this same task, so a transfer to a vanished dongle ends
+        // by its 5 s timeout instead; that stalls the HID task once, but safely.)
+        xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
         if (handle == s_dongle) {
             s_dongle = NULL;
             s_dongle_gone = true;
         }
+        xSemaphoreGive(s_dongle_lock);
         hid_host_device_close(handle);
         break;
     case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
@@ -645,7 +666,9 @@ static void hid_driver_cb(hid_host_device_handle_t handle, const hid_host_driver
 {
     // Runs in the HID driver task: hand off to the app task.
     hid_driver_msg_t msg = {.handle = handle, .event = event};
-    xQueueSend(s_hid_driver_q, &msg, 0);
+    if (xQueueSend(s_hid_driver_q, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGE(TAG, "HID driver event %d dropped (app task busy); replug the dongle", event);
+    }
 }
 
 static void usb_lib_task(void *arg)
@@ -678,9 +701,7 @@ static void usb_lib_task(void *arg)
     ESP_ERROR_CHECK(esp_timer_create(&replug_timer_args, &replug_timer));
     // +8 s after power-on: past debounce(300ms)+reset+recovery windows; the
     // timer cb re-checks s_dongle before bouncing, so an on-time dongle skips it.
-    // esp_timer_start_once takes MICROSECONDS — a tick count here (800 us at
-    // 100 Hz) fires the bounce inside the settle window, recreating the exact
-    // race the delay was sized to avoid.
+    // esp_timer_start_once takes MICROSECONDS, not ticks (see AGENTS.md gotcha 5).
     ESP_ERROR_CHECK(esp_timer_start_once(replug_timer, 8 * 1000000));
 #endif
     while (true) {
@@ -703,12 +724,23 @@ static void open_hid_device(hid_host_device_handle_t handle)
         ESP_LOGI(TAG, "ignoring HID device %04x:%04x", info.VID, info.PID);
         return;
     }
+    if (s_dongle) {
+        ESP_LOGW(TAG, "a Wyze dongle is already in use, ignoring the second one");
+        return;
+    }
     const hid_host_device_config_t dev_config = {.callback = hid_interface_cb, .callback_arg = NULL};
-    if (hid_host_device_open(handle, &dev_config) != ESP_OK || hid_host_device_start(handle) != ESP_OK) {
+    if (hid_host_device_open(handle, &dev_config) != ESP_OK) {
         ESP_LOGE(TAG, "failed to open Wyze dongle");
         return;
     }
+    if (hid_host_device_start(handle) != ESP_OK) {
+        ESP_LOGE(TAG, "failed to start Wyze dongle");
+        hid_host_device_close(handle);
+        return;
+    }
+    xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
     s_dongle = handle;  // s_dongle_gone stays set until the main loop recycles the WebSocket
+    xSemaphoreGive(s_dongle_lock);
     ESP_LOGI(TAG, "Wyze dongle up, connecting to gateway");
 }
 
@@ -719,12 +751,14 @@ static void to_dongle_task(void *arg)
         if (xQueueReceive(s_to_dongle_q, &f, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        hid_host_device_handle_t dev = s_dongle;
-        if (!dev) {
+        xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+        if (!s_dongle) {
+            xSemaphoreGive(s_dongle_lock);
             continue;
         }
         // Mirrors a Linux hidraw write on a device without an OUT endpoint.
-        esp_err_t err = hid_class_request_set_report(dev, HID_REPORT_TYPE_OUTPUT, 0, f.data, f.len);
+        esp_err_t err = hid_class_request_set_report(s_dongle, HID_REPORT_TYPE_OUTPUT, 0, f.data, f.len);
+        xSemaphoreGive(s_dongle_lock);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "SET_REPORT (%u bytes) failed: %s", f.len, esp_err_to_name(err));
         } else {
@@ -1017,7 +1051,9 @@ void app_main(void)
     console_setup();
 
     s_events = xEventGroupCreate();
-    s_hid_driver_q = xQueueCreate(4, sizeof(hid_driver_msg_t));
+    s_hid_driver_q = xQueueCreate(8, sizeof(hid_driver_msg_t));
+    s_dongle_lock = xSemaphoreCreateMutex();
+    s_ws_lock = xSemaphoreCreateMutex();
     s_to_gateway_q = xQueueCreate(16, sizeof(frame_t));
     s_to_dongle_q = xQueueCreate(16, sizeof(frame_t));
 
@@ -1060,8 +1096,10 @@ void app_main(void)
         // A dongle that went away (even if already replugged) or a switch between
         // Ethernet and Wi-Fi ends the session: the gateway must redo its handshake,
         // and a socket bound to the old interface is dead anyway.
-        bool restart = s_dongle_gone;
+        xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+        const bool restart = s_dongle_gone;
         s_dongle_gone = false;
+        xSemaphoreGive(s_dongle_lock);
         if (s_ws && (restart || !s_dongle || net != ws_net)) {
             ws_stop();
         }
