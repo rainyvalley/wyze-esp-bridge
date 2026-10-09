@@ -620,8 +620,14 @@ static net_kind_t net_active(void)
 //  - fire late (+8 s after power-on) so the port is in a settled state,
 //    past debounce + reset + recovery, before we touch power again
 //  - skip entirely once the dongle is up
+// It runs in its own short-lived task (created once, deletes itself), not an esp_timer
+// callback: the 200 ms power-off sleep would block every other esp_timer callback (Wi-Fi
+// retry, IDF component timers). Timing and the calls themselves are unchanged; usb_lib_task
+// keeps handling hub events during the sleep, as it did when this was a timer callback.
 #if CONFIG_IDF_TARGET_ESP32P4
-static void usb_replug_timer_cb(void *arg)
+#define USB_REPLUG_DELAY_MS 8000
+
+static void usb_replug_bounce(void)
 {
     if (s_dongle) {
         return;
@@ -637,6 +643,13 @@ static void usb_replug_timer_cb(void *arg)
             ESP_LOGI(TAG, "root port power bounced (dongle not up)");
         }
     }
+}
+
+static void usb_replug_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(USB_REPLUG_DELAY_MS));
+    usb_replug_bounce();
+    vTaskDelete(NULL);
 }
 #endif
 
@@ -722,17 +735,12 @@ static void usb_lib_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_ERROR_CHECK(usb_host_lib_set_root_port_power(true));
     ESP_LOGI(TAG, "root port power on");
-    const esp_timer_create_args_t replug_timer_args = {
-        .callback = usb_replug_timer_cb,
-        .name = "usb-replug",
-        .dispatch_method = ESP_TIMER_TASK,
-    };
-    esp_timer_handle_t replug_timer;
-    ESP_ERROR_CHECK(esp_timer_create(&replug_timer_args, &replug_timer));
     // +8 s after power-on: past debounce(300ms)+reset+recovery windows; the
-    // timer cb re-checks s_dongle before bouncing, so an on-time dongle skips it.
-    // esp_timer_start_once takes MICROSECONDS, not ticks (see AGENTS.md gotcha 5).
-    ESP_ERROR_CHECK(esp_timer_start_once(replug_timer, 8 * 1000000));
+    // task re-checks s_dongle before bouncing, so an on-time dongle skips it.
+    // Core 0 and a priority above this task's (2), like the esp_timer task it replaces.
+    if (xTaskCreatePinnedToCore(usb_replug_task, "usb_replug", 4096, NULL, 5, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "could not start the replug task; replug the dongle by hand if it does not come up");
+    }
 #endif
     while (true) {
         uint32_t flags;
