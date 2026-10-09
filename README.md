@@ -37,8 +37,8 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
 - **Ethernet is primary.** Once it has an IP (not merely a link — a cable into a dead port or a
   switch without DHCP doesn't count), Wi-Fi shuts off (`wifi stopped (ethernet is primary)`).
 - **Wi-Fi is a fallback** (when an SSID is configured): at boot it starts if Ethernet has no IP
-  within 8 s, starts ~1 s after the link drops, retries every 5 s, and stops when Ethernet has an
-  IP again. Never both in use at once. Boards without Ethernet hardware go straight to Wi-Fi.
+  within 8 s, starts ~1 s after the link drops (or after Ethernet loses its DHCP address), retries
+  every 5 s, and stops when Ethernet has an IP again. Never both in use at once. Boards without Ethernet hardware go straight to Wi-Fi.
 - The WebSocket stays open only while the dongle is plugged in **and** a network is up. Switching
   between Ethernet and Wi-Fi, or replugging the dongle, recycles the gateway session. A wedged
   WebSocket client is detected and rebuilt (~2 min watchdog).
@@ -60,15 +60,20 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
    - your gateway URI (e.g. `ws://192.168.1.50:8080/ws/bridge`)
    - your bridge token, matching the gateway's `bridge.auth_token` (masked input; Enter keeps the currently stored value)
    - Wi-Fi SSID and password (leave SSID blank for pure-Ethernet operation)
-   
-   Values are stored in NVS and survive reboots and OTA updates. If you leave the defaults baked into
-   `sdkconfig.defaults` (edit + rebuild yourself), setup is skipped entirely.
+
+   At every prompt, Enter keeps the value in brackets and `-` clears it (e.g. `-` at the SSID
+   prompt turns Wi-Fi off). A prompt left unanswered for 60 s cancels setup without saving, and the
+   board boots normally.
+
+   Values are stored in NVS and survive reboots and OTA updates. If you bake your values in at build
+   time instead (`sdkconfig.local.defaults`, see [Build from source](#build-from-source)), just let
+   the 3 s prompt time out.
 5. The board boots into `waiting for Wyze dongle`; plug the dongle into the USB-A port (sold with
    your Wyze system, the little USB-A stick), and you'll see:
    ```
-   wyze-esp-bridge 2.2.4 (esp32p4-eth)
+   wyze-esp-bridge 2.3.0 (esp32p4-eth)
    ...
-   network up (wifi fallback), IP 192.168.x.x     <- if no ethernet cable
+   network up (wifi), IP 192.168.x.x     <- if no ethernet cable
    Wyze dongle up, connecting to gateway
    gateway connected
    ```
@@ -83,12 +88,15 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
 The setup prompt asks for a Wi-Fi SSID and password at the same time as the gateway settings:
 
 - **SSID + password stored → the board uses Ethernet when the cable is in, and Wi-Fi when it's out.**
-- **Leave SSID blank → Wi-Fi stays off entirely** (pure-Ethernet board, like before v2.2).
+- **Leave SSID blank (or enter `-` to clear a stored one) → Wi-Fi stays off entirely** (pure-Ethernet
+  board, like before v2.2).
 - The Wi-Fi runs on the board's ESP32-C6 co-processor over SDIO (ESP-Hosted). A factory C6 firmware
   prints `esp-hosted fw versions: host=3.x coprocessor=0.0.0`+`major version mismatch` at boot —
   harmless (association + data path work); updating the C6 firmware via esp-usb/esp-hosted OTA is
   on the roadmap. Currently 2.4 GHz only (C6 limit).
-- Wi-Fi connect failures retry every 5 s; association works with WPA1/WPA2/WPA3-mixed and open APs.
+- Wi-Fi connect failures retry every 5 s; association works with WPA1/WPA2/WPA3-mixed APs, and with
+  open APs only when no password is set (with a password set, an open AP using the same SSID is
+  refused).
 
 A useful debugging window between resets: board `/status` over Wi-Fi can be flaky in dual-homed
 LANs (some APs isolate clients); the **gateway's dashboard is the source of truth** for whether a
@@ -123,7 +131,11 @@ EOF
 ```
 
 HTTP endpoints: `GET /status` (JSON), `GET /log` (this boot's ring buffer), `POST /ota` (token),
-`POST /reboot` (token). Token can also be `?token=` query-param.
+`POST /reboot` (token). Token can also be `?token=` query-param (percent-encoded).
+
+`/status` and `/log` need no token. Values of `token=` are masked in the log. **While no token is
+set, `/ota` and `/reboot` are open to anyone on the network**: set a token on the console, or build
+with `CONFIG_WYZE_REQUIRE_TOKEN=y` to refuse them until one is set.
 
 ## Build from source
 
@@ -144,7 +156,15 @@ docker run --rm -v "$PWD":/project -w /project espressif/idf:release-v5.5 \
   set-target esp32p4 reconfigure build
 ```
 
-Every release binary on this repo is built by CI from that exact command.
+Every release binary on this repo is built by CI with `./build.sh` (all variants) in the same
+container image, pinned by digest in `.github/workflows/release.yml`; releases include `SHA256SUMS`.
+
+Site-specific values (gateway URI, token, Wi-Fi credentials) can be baked in through a git-ignored
+`sdkconfig.local.defaults`, which `build.sh` appends when present. Images built that way contain
+those secrets in plain text: never share or upload them.
+
+Component versions are locked per target in `dependencies.lock.esp32p4` and
+`dependencies.lock.esp32s3`.
 
 ## Protocol notes
 
@@ -164,7 +184,8 @@ Every release binary on this repo is built by CI from that exact command.
   settle bounce plus a one-shot replug emulation (8 s after power-on) recovers it. If the dongle
   never comes up, unplug/replug it once.
 - **`StaDisconnected reason=211`** — the Wi-Fi scan threshold filtered your AP (older builds);
-  v2.2.2+ uses an open scan threshold. Reason 202 = wrong password.
+  v2.2.2+ uses the weakest PSK threshold (WPA) when a password is set, open otherwise. Reason 202 =
+  wrong password.
 - **`esp-hosted fw versions ... major version mismatch`** — the factory C6 co-processor firmware;
   benign, Wi-Fi still works.
 - **Boot-loop on older P4 revisions with the dongle pre-powered** — fixed since v2.0.8
