@@ -114,8 +114,12 @@ pipx run esptool --chip esp32p4 -p /dev/ttyACM0 chip_id
 - Chip revision `v0.x`/`v1.x` (e.g. `v1.3`) → use `wyze-esp-bridge-p4-rev1-*.bin`
 
 Current `PARTITION` is printed in `/status`; the board has 16 MB flash and two 3 MB OTA slots. OTA
-rollback is armed: a new image only sticks if it reaches the network (gets an IP); otherwise the next
-reset rolls back to the previous slot.
+rollback is armed: a new image is on trial until its WebSocket connection to the gateway comes up,
+and any reset before that (crash, watchdog, `/reboot`, saving settings on the console) rolls back to
+the previous slot. If the gateway has not connected 5 minutes after the network came up (gateway
+down or misconfigured, dongle unplugged), the image is kept anyway, so a gateway problem never
+causes a rollback. An image that never gets an IP is never kept. While an image is on trial,
+`POST /ota` answers `503` (ESP-IDF cannot start another update before the running one is confirmed).
 
 ### OTA updates (once the bridge is online)
 

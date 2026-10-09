@@ -355,6 +355,7 @@ static esp_websocket_client_handle_t s_ws;
 static esp_netif_t *s_netif;       // Ethernet; NULL when no Ethernet hardware answered
 static esp_netif_t *s_wifi_netif;  // NULL unless a Wi-Fi SSID is configured
 static bool s_ws_bad_uri;
+static volatile bool s_gateway_seen;  // set on the first WebSocket CONNECTED; read by the main loop
 static volatile uint32_t s_frames_up, s_frames_down;
 
 // ---------------------------------------------------------------- Ethernet / WiFi
@@ -429,8 +430,6 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "network up (ethernet), IP " IPSTR, IP2STR(&ev->ip_info.ip));
         xEventGroupSetBits(s_events, ETH_IP_BIT);
-        // A new image that gets on the network is kept; otherwise the bootloader rolls back.
-        esp_ota_mark_app_valid_cancel_rollback();
 #if HAS_WIFI
         wifi_arm(WIFI_STOP_US);  // replaces any pending start; stops Wi-Fi if it is running
 #endif
@@ -461,7 +460,6 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         } else {
             ESP_LOGW(TAG, "network up (wifi), IP " IPSTR, IP2STR(&ev->ip_info.ip));
             xEventGroupSetBits(s_events, WIFI_IP_BIT);
-            esp_ota_mark_app_valid_cancel_rollback();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
         xEventGroupClearBits(s_events, WIFI_IP_BIT);
@@ -807,6 +805,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "gateway connected");
+        s_gateway_seen = true;  // the main loop confirms a new OTA image (ota_confirm_poll)
         xQueueReset(s_to_dongle_q);
         s_rx_active = false;
         break;
@@ -943,6 +942,51 @@ static void to_gateway_task(void *arg)
         }
         xSemaphoreGive(s_ws_lock);
     }
+}
+
+// ---------------------------------------------------------------- OTA image confirmation
+
+// With CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE a freshly OTA'd image boots in PENDING_VERIFY, and
+// any reset before it is marked valid rolls back to the previous slot. It is marked valid once
+// the WebSocket to the gateway connects (dongle, network and gateway all work), not merely on an
+// IP. Bound: if the gateway has not connected OTA_CONFIRM_FALLBACK_US after the first IP of this
+// boot (gateway down or misconfigured, dongle unplugged), the image is kept anyway, so a gateway
+// problem never turns into a rollback. An image that never gets an IP is never confirmed.
+// The confirmation runs in the main loop, never in the WebSocket or event-loop tasks.
+#define OTA_CONFIRM_FALLBACK_US (5 * 60 * 1000000LL)
+
+static bool ota_pending_verify(void)
+{
+    esp_ota_img_states_t state;
+    return esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+           state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+// Called from the main loop while the image is pending. Returns true when done (confirmed, or
+// confirmation failed and was logged), false to be polled again.
+static bool ota_confirm_poll(net_kind_t net, int64_t *net_since_us)
+{
+    const char *why = NULL;
+    if (s_gateway_seen) {
+        why = "gateway connected";
+    } else if (net != NET_NONE) {
+        const int64_t now = esp_timer_get_time();
+        if (*net_since_us < 0) {
+            *net_since_us = now;
+        } else if (now - *net_since_us >= OTA_CONFIRM_FALLBACK_US) {
+            why = "no gateway connection 5 min after the network came up; keeping it anyway";
+        }
+    }
+    if (!why) {
+        return false;
+    }
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not mark this firmware valid (%s); the next reset rolls back", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "new firmware marked valid (%s)", why);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------- HTTP: status, log, OTA
@@ -1091,6 +1135,12 @@ static esp_err_t ota_post(httpd_req_t *req)
         httpd_resp_set_status(req, "401 Unauthorized");
         return httpd_resp_sendstr(req, "bad or missing token\n");
     }
+    if (ota_pending_verify()) {
+        // esp_ota_begin() refuses this state (ESP_ERR_OTA_ROLLBACK_INVALID_STATE); say why.
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "running firmware is still on trial (confirmed once the gateway connects, "
+                                       "at most 5 min after the network is up); retry later\n");
+    }
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part || req->content_len == 0 || req->content_len > part->size) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or oversized image");
@@ -1235,6 +1285,12 @@ void app_main(void)
     uint32_t last_frames = UINT32_MAX;
     int wedged_polls = 0;
     net_kind_t ws_net = NET_NONE;
+    bool ota_pending = ota_pending_verify();
+    int64_t ota_net_since_us = -1;
+    if (ota_pending) {
+        ESP_LOGW(TAG, "new firmware on trial: kept once the gateway connects (at most 5 min after the "
+                      "network is up); a reset before that rolls back");
+    }
     while (true) {
         hid_driver_msg_t msg;
         if (xQueueReceive(s_hid_driver_q, &msg, pdMS_TO_TICKS(500)) == pdTRUE &&
@@ -1242,6 +1298,9 @@ void app_main(void)
             open_hid_device(msg.handle);
         }
         const net_kind_t net = net_active();
+        if (ota_pending && ota_confirm_poll(net, &ota_net_since_us)) {
+            ota_pending = false;
+        }
         // A dongle that went away (even if already replugged) or a switch between
         // Ethernet and Wi-Fi ends the session: the gateway must redo its handshake,
         // and a socket bound to the old interface is dead anyway.
