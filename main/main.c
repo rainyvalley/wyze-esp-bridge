@@ -41,6 +41,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -63,6 +64,8 @@ static const char *TAG = "wyze-bridge";
 
 #define DONGLE_VID 0x1a86
 #define DONGLE_PID 0xe024
+// Input report buffer size, and the output report size assumed when the dongle's report
+// descriptor cannot be read or parsed (see hid_output_report_len).
 #define HID_REPORT_LEN 64
 #define MAX_FRAME 128
 #define CONSOLE_UART UART_NUM_0
@@ -91,9 +94,34 @@ static const char *TAG = "wyze-bridge";
 #define LOG_BUF_SIZE 49152
 
 static char s_log[LOG_BUF_SIZE];
-static size_t s_log_head;  // next write position
-static bool s_log_wrapped;
+static uint64_t s_log_written;  // total bytes ever written; s_log[s_log_written % LOG_BUF_SIZE] is next
 static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Masks the value of every "token=" in a log line. The gateway URI carries the bridge token in
+// its query string, and component code (e.g. the WebSocket client's "Error parse uri = %s")
+// may log that URI; /log is served without auth.
+static bool log_redact_token(char *line)
+{
+    bool redacted = false;
+    for (char *p = strstr(line, "token="); p; p = strstr(p, "token=")) {
+        p += 6;
+        char *end = p;
+        while (*end && *end != '&' && *end != '"' && *end != ' ' && *end != '\r' && *end != '\n') {
+            end++;
+        }
+        if (end - p >= 3) {
+            memmove(p + 3, end, strlen(end) + 1);  // shrinks or keeps the length: never overflows
+            memcpy(p, "***", 3);
+            p += 3;
+            redacted = true;
+        } else if (end > p) {
+            memset(p, '*', end - p);
+            p = end;
+            redacted = true;
+        }
+    }
+    return redacted;
+}
 
 static int log_vprintf(const char *fmt, va_list args)
 {
@@ -102,19 +130,23 @@ static int log_vprintf(const char *fmt, va_list args)
     va_copy(copy, args);
     int n = vsnprintf(line, sizeof(line), fmt, copy);
     va_end(copy);
-    if (n > 0) {
-        size_t len = n < (int)sizeof(line) ? (size_t)n : sizeof(line) - 1;
-        taskENTER_CRITICAL(&s_log_lock);
-        for (size_t i = 0; i < len; i++) {
-            s_log[s_log_head++] = line[i];
-            if (s_log_head == LOG_BUF_SIZE) {
-                s_log_head = 0;
-                s_log_wrapped = true;
-            }
-        }
-        taskEXIT_CRITICAL(&s_log_lock);
+    if (n <= 0) {
+        return vprintf(fmt, args);
     }
-    return vprintf(fmt, args);
+    const bool redacted = log_redact_token(line);
+    const size_t len = strlen(line);
+    taskENTER_CRITICAL(&s_log_lock);
+    size_t idx = s_log_written % LOG_BUF_SIZE;
+    for (size_t i = 0; i < len; i++) {
+        s_log[idx++] = line[i];
+        if (idx == LOG_BUF_SIZE) {
+            idx = 0;
+        }
+    }
+    s_log_written += len;
+    taskEXIT_CRITICAL(&s_log_lock);
+    // Print the redacted copy (possibly truncated) rather than leak the token on the UART too.
+    return redacted ? printf("%s", line) : vprintf(fmt, args);
 }
 
 // ---------------------------------------------------------------- config
@@ -159,35 +191,45 @@ static esp_err_t config_save(void)
 {
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open("bridge", NVS_READWRITE, &h), TAG, "nvs_open");
-    nvs_set_str(h, "uri", s_cfg.uri);
-    nvs_set_str(h, "token", s_cfg.token);
-    nvs_set_str(h, "wifi_ssid", s_cfg.wifi_ssid);
-    nvs_set_str(h, "wifi_pass", s_cfg.wifi_pass);
-    esp_err_t err = nvs_commit(h);
+    esp_err_t err = nvs_set_str(h, "uri", s_cfg.uri);
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "token", s_cfg.token);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "wifi_ssid", s_cfg.wifi_ssid);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "wifi_pass", s_cfg.wifi_pass);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
     nvs_close(h);
     return err;
 }
 
-// Reads a line from the console UART. Returns false on timeout before any *printable* input.
-// Non-printable bytes (0x00 etc. from USB-UART line toggles when a terminal attaches
-// mid-boot) must not cancel the setup-prompt timeout: they used to switch the read to
-// an infinite wait, hanging boot until a terminal pressed Enter.
-static bool console_read_line(char *out, size_t size, bool secret, TickType_t first_key_timeout)
+// Setup-dialog input deadline: a prompt left unanswered this long (e.g. it was entered by line
+// noise on a headless board) aborts the dialog and boot continues with the current values.
+#define CONSOLE_IDLE_MS 60000
+
+// Reads a line from the console UART. Returns false if no complete line arrives within
+// idle_timeout of the start or of the last keystroke. Non-printable bytes (0x00 etc. from
+// USB-UART line toggles when a terminal attaches mid-boot) are ignored and do not extend the
+// deadline, so line noise can never hang boot.
+static bool console_read_line(char *out, size_t size, bool secret, TickType_t idle_timeout)
 {
     size_t n = 0;
-    TickType_t timeout = first_key_timeout;
+    TickType_t deadline = xTaskGetTickCount() + idle_timeout;
     while (true) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(deadline - now) <= 0) {
+            out[n] = '\0';
+            return false;
+        }
         uint8_t c;
-        if (uart_read_bytes(CONSOLE_UART, &c, 1, timeout) != 1) {
-            if (n == 0 && timeout != portMAX_DELAY) {
-                return false;
-            }
+        if (uart_read_bytes(CONSOLE_UART, &c, 1, deadline - now) != 1) {
             continue;
         }
-        if (n == 0 && timeout != portMAX_DELAY && !(c >= 0x20 && c < 0x7f) && c != '\r' && c != '\n') {
-            continue;  // ignore line-noise before input starts; keep the deadline
-        }
-        timeout = portMAX_DELAY;
         if (c == '\r' || c == '\n') {
             if (n == 0 && c == '\n') {
                 continue;  // swallow the LF of a CRLF pair
@@ -197,28 +239,55 @@ static bool console_read_line(char *out, size_t size, bool secret, TickType_t fi
         if ((c == 0x08 || c == 0x7f) && n > 0) {
             n--;
             uart_write_bytes(CONSOLE_UART, "\b \b", 3);
-            continue;
-        }
-        if (c >= 0x20 && c < 0x7f && n + 1 < size) {
+        } else if (c >= 0x20 && c < 0x7f && n + 1 < size) {
             out[n++] = (char)c;
             uart_write_bytes(CONSOLE_UART, secret ? "*" : (const char *)&c, 1);
+        } else {
+            continue;
         }
+        deadline = xTaskGetTickCount() + idle_timeout;
     }
     out[n] = '\0';
     uart_write_bytes(CONSOLE_UART, "\r\n", 2);
     return true;
 }
 
-static void prompt(const char *label, char *field, size_t size, bool secret)
+// Waits up to timeout for Enter (CR or LF). Every other byte is ignored, so the boot window
+// stays exactly timeout long whatever arrives on the line.
+static bool console_wait_enter(TickType_t timeout)
+{
+    const TickType_t deadline = xTaskGetTickCount() + timeout;
+    while (true) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(deadline - now) <= 0) {
+            return false;
+        }
+        uint8_t c;
+        if (uart_read_bytes(CONSOLE_UART, &c, 1, deadline - now) == 1 && (c == '\r' || c == '\n')) {
+            return true;
+        }
+    }
+}
+
+// Enter keeps the current value; "-" clears it (when can_clear). Returns false on timeout.
+static bool prompt(const char *label, char *field, size_t size, bool secret, bool can_clear)
 {
     char line[128];
     const char *shown = secret ? (field[0] ? "<unchanged>" : "") : field;
     printf("%s [%s]: ", label, shown);
     fflush(stdout);
-    console_read_line(line, sizeof(line), secret, portMAX_DELAY);
-    if (line[0]) {
-        strlcpy(field, line, size);
+    if (!console_read_line(line, sizeof(line), secret, pdMS_TO_TICKS(CONSOLE_IDLE_MS))) {
+        printf("\nNo input for %d s, setup cancelled (nothing saved).\n", CONSOLE_IDLE_MS / 1000);
+        return false;
     }
+    if (can_clear && strcmp(line, "-") == 0) {
+        field[0] = '\0';
+    } else if (line[0]) {
+        if (strlcpy(field, line, size) >= size) {
+            printf("Warning: truncated to %u characters.\n", (unsigned)(size - 1));
+        }
+    }
+    return true;
 }
 
 // Built-in defaults work as-is, so setup is only offered, never required.
@@ -226,19 +295,28 @@ static void console_setup(void)
 {
     ESP_ERROR_CHECK(uart_driver_install(CONSOLE_UART, 256, 0, 0, NULL, 0));
     printf("\nGateway %s\nPress Enter within 3 s to change settings...\n", s_cfg.uri);
-    char line[8];
-    if (!console_read_line(line, sizeof(line), false, pdMS_TO_TICKS(3000))) {
+    if (!console_wait_enter(pdMS_TO_TICKS(3000))) {
         return;
     }
-    printf("\n=== wyze-esp-bridge setup (Enter keeps the value in brackets) ===\n");
-    prompt("Gateway URI", s_cfg.uri, sizeof(s_cfg.uri), false);
-    prompt("Bridge token", s_cfg.token, sizeof(s_cfg.token), true);
-    prompt("WiFi SSID (used when Ethernet has no IP, blank = off)", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), false);
-    prompt("WiFi password", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), true);
+    const bridge_config_t saved = s_cfg;
+    printf("\n=== wyze-esp-bridge setup (Enter keeps the value in brackets, \"-\" clears it) ===\n");
+    if (!prompt("Gateway URI", s_cfg.uri, sizeof(s_cfg.uri), false, false) ||
+        !prompt("Bridge token", s_cfg.token, sizeof(s_cfg.token), true, true) ||
+        !prompt("WiFi SSID (used when Ethernet has no IP, \"-\" = off)", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid),
+                false, true) ||
+        !prompt("WiFi password", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), true, true)) {
+        s_cfg = saved;
+        return;
+    }
     if (s_cfg.wifi_ssid[0] == '\0') {
         s_cfg.wifi_pass[0] = '\0';  // no SSID: drop any stale password
     }
-    ESP_ERROR_CHECK(config_save());
+    esp_err_t err = config_save();
+    if (err != ESP_OK) {
+        // Keep running with the values entered; they are lost on the next reboot.
+        printf("Saving failed (%s); using the new values until the next reboot.\n", esp_err_to_name(err));
+        return;
+    }
     printf("Saved. Restarting...\n");
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
@@ -266,12 +344,21 @@ static EventGroupHandle_t s_events;
 static QueueHandle_t s_hid_driver_q;  // new HID devices (driver callback -> app task)
 static QueueHandle_t s_to_gateway_q;  // dongle -> gateway frames
 static QueueHandle_t s_to_dongle_q;   // gateway -> dongle frames
-static volatile hid_host_device_handle_t s_dongle;
-static volatile bool s_dongle_gone;
+// s_dongle_lock guards s_dongle and s_dongle_gone, and is held across every SET_REPORT so the
+// HID driver cannot tear the device down underneath an in-flight control transfer.
+static SemaphoreHandle_t s_dongle_lock;
+static hid_host_device_handle_t s_dongle;
+static size_t s_dongle_out_len;  // output report size in bytes; larger gateway packets are not sent
+static bool s_dongle_gone;
+// s_ws_lock guards s_ws for tasks other than the main loop (the only writer): it is held across
+// every use of the client from to_gateway_task and the HTTP server, and taken by ws_stop()
+// before the client is destroyed.
+static SemaphoreHandle_t s_ws_lock;
 static esp_websocket_client_handle_t s_ws;
 static esp_netif_t *s_netif;       // Ethernet; NULL when no Ethernet hardware answered
 static esp_netif_t *s_wifi_netif;  // NULL unless a Wi-Fi SSID is configured
 static bool s_ws_bad_uri;
+static volatile bool s_gateway_seen;  // set on the first WebSocket CONNECTED; read by the main loop
 static volatile uint32_t s_frames_up, s_frames_down;
 
 // ---------------------------------------------------------------- Ethernet / WiFi
@@ -282,13 +369,21 @@ static volatile uint32_t s_frames_up, s_frames_down;
 #if HAS_WIFI
 #define WIFI_RETRY_US (5 * 1000000)
 #define WIFI_BOOT_GRACE_US (8 * 1000000)  // let Ethernet link + DHCP first at boot
+#define WIFI_LINKDOWN_US (1 * 1000000)    // Ethernet link or address lost -> start Wi-Fi
+#define WIFI_STOP_US 1000                 // Ethernet is back -> stop Wi-Fi, outside the event loop
 static esp_timer_handle_t s_wifi_retry_timer;
 static volatile bool s_wifi_running;  // between STA_START and STA_STOP
 
 static void wifi_retry_timer_cb(void *arg)
 {
-    // Ethernet-first: once it has an address the WLAN rests (link-down restarts it).
+    // Ethernet-first: once it has an address the WLAN rests (link-down restarts it). The stop
+    // happens here rather than in net_event_handler: on the P4 esp_wifi_stop() is a blocking
+    // RPC to the C6 and must not stall the shared default event loop.
     if (xEventGroupGetBits(s_events) & ETH_IP_BIT) {
+        if (s_wifi_running) {
+            ESP_LOGI(TAG, "wifi stopped (ethernet is primary)");
+            esp_wifi_stop();
+        }
         return;
     }
     if (s_wifi_running) {
@@ -325,22 +420,21 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
                  (unsigned long)s_frames_down);
         xEventGroupClearBits(s_events, ETH_LINK_BIT | ETH_IP_BIT);
 #if HAS_WIFI
-        wifi_arm(1000);
+        wifi_arm(WIFI_LINKDOWN_US);
+#endif
+    } else if (base == IP_EVENT && id == IP_EVENT_ETH_LOST_IP) {
+        // DHCP lease gone with the link still up (e.g. the DHCP server is down).
+        ESP_LOGW(TAG, "ethernet lost its IP");
+        xEventGroupClearBits(s_events, ETH_IP_BIT);
+#if HAS_WIFI
+        wifi_arm(WIFI_LINKDOWN_US);
 #endif
     } else if (base == IP_EVENT && id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "network up (ethernet), IP " IPSTR, IP2STR(&ev->ip_info.ip));
         xEventGroupSetBits(s_events, ETH_IP_BIT);
-        // A new image that gets on the network is kept; otherwise the bootloader rolls back.
-        esp_ota_mark_app_valid_cancel_rollback();
 #if HAS_WIFI
-        if (s_wifi_netif) {
-            esp_timer_stop(s_wifi_retry_timer);
-            if (s_wifi_running) {
-                ESP_LOGI(TAG, "wifi stopped (ethernet is primary)");
-                esp_wifi_stop();
-            }
-        }
+        wifi_arm(WIFI_STOP_US);  // replaces any pending start; stops Wi-Fi if it is running
 #endif
     }
 #if HAS_WIFI
@@ -365,11 +459,10 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         if (xEventGroupGetBits(s_events) & ETH_IP_BIT) {
             ESP_LOGI(TAG, "wifi got IP but ethernet is up; stopping wifi");
-            esp_wifi_stop();
+            wifi_arm(WIFI_STOP_US);
         } else {
             ESP_LOGW(TAG, "network up (wifi), IP " IPSTR, IP2STR(&ev->ip_info.ip));
             xEventGroupSetBits(s_events, WIFI_IP_BIT);
-            esp_ota_mark_app_valid_cancel_rollback();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
         xEventGroupClearBits(s_events, WIFI_IP_BIT);
@@ -412,7 +505,7 @@ static bool eth_start(void)
     esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
 #endif
     esp_eth_handle_t eth = NULL;
-    esp_err_t err = ESP_ERR_NO_MEM;
+    esp_err_t err = ESP_ERR_NOT_FOUND;  // MAC or PHY driver could not be created
     if (mac && phy) {
         esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
         err = esp_eth_driver_install(&eth_cfg, &eth);
@@ -441,6 +534,7 @@ static bool eth_start(void)
     ESP_ERROR_CHECK(esp_netif_attach(s_netif, esp_eth_new_netif_glue(eth)));
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, net_event_handler, NULL));
     ESP_ERROR_CHECK(esp_eth_start(eth));
     return true;
 }
@@ -453,33 +547,37 @@ static void wifi_init(bool have_eth)
     if (!s_cfg.wifi_ssid[0]) {
         return;
     }
-    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, net_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, net_event_handler, NULL));
-    s_wifi_netif = esp_netif_create_default_wifi_sta();
-#if CONFIG_ESP_HOSTED
-    // The hosted port's create_default skips the io-driver binding that installs the
-    // wlanif input path (IDF's native one does it): without this every RX frame is
-    // dropped ("eh_rx_guard: netif input not attached yet") and DHCP never completes.
-    ESP_ERROR_CHECK(esp_netif_attach_wifi_station(s_wifi_netif));
-#endif
-    ESP_ERROR_CHECK(esp_netif_set_hostname(s_wifi_netif, HOSTNAME));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    wifi_config_t sta_cfg = {0};
-    strlcpy((char *)sta_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid));
-    strlcpy((char *)sta_cfg.sta.password, s_cfg.wifi_pass, sizeof(sta_cfg.sta.password));
-    // Never filter harder than the target AP broadcasts: reason 211
-    // (NO_AP_FOUND_IN_AUTHMODE_THRESHOLD) on WPA/WPA2-mixed or open networks.
-    // The password still enforces at association.
-    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    // The retry timer exists before s_wifi_netif is published: the Ethernet handlers are
+    // already live and only check s_wifi_netif before arming it.
     const esp_timer_create_args_t retry_timer_args = {
         .callback = wifi_retry_timer_cb,
         .name = "wifi-retry",
     };
     ESP_ERROR_CHECK(esp_timer_create(&retry_timer_args, &s_wifi_retry_timer));
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, net_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, net_event_handler, NULL));
+    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
+#if CONFIG_ESP_HOSTED
+    // The hosted port's create_default skips the io-driver binding that installs the
+    // wlanif input path (IDF's native one does it): without this every RX frame is
+    // dropped ("eh_rx_guard: netif input not attached yet") and DHCP never completes.
+    ESP_ERROR_CHECK(esp_netif_attach_wifi_station(netif));
+#endif
+    ESP_ERROR_CHECK(esp_netif_set_hostname(netif, HOSTNAME));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    wifi_config_t sta_cfg = {0};
+    strlcpy((char *)sta_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid));
+    strlcpy((char *)sta_cfg.sta.password, s_cfg.wifi_pass, sizeof(sta_cfg.sta.password));
+    // Scan threshold: WPA_PSK is the weakest PSK mode, so WPA/WPA2/WPA3-mixed APs still pass
+    // (a stricter threshold gives reason 211, NO_AP_FOUND_IN_AUTHMODE_THRESHOLD). It must not
+    // be OPEN when a password is set: an open AP spoofing the SSID never asks for the password,
+    // so the station would join it.
+    sta_cfg.sta.threshold.authmode = s_cfg.wifi_pass[0] ? WIFI_AUTH_WPA_PSK : WIFI_AUTH_OPEN;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    s_wifi_netif = netif;
     if (have_eth) {
         ESP_LOGI(TAG, "wifi fallback armed (ssid: %s), starts if ethernet has no IP in 8 s", s_cfg.wifi_ssid);
         wifi_arm(WIFI_BOOT_GRACE_US);
@@ -522,7 +620,14 @@ static net_kind_t net_active(void)
 //  - fire late (+8 s after power-on) so the port is in a settled state,
 //    past debounce + reset + recovery, before we touch power again
 //  - skip entirely once the dongle is up
-static void usb_replug_timer_cb(void *arg)
+// It runs in its own short-lived task (created once, deletes itself), not an esp_timer
+// callback: the 200 ms power-off sleep would block every other esp_timer callback (Wi-Fi
+// retry, IDF component timers). Timing and the calls themselves are unchanged; usb_lib_task
+// keeps handling hub events during the sleep, as it did when this was a timer callback.
+#if CONFIG_IDF_TARGET_ESP32P4
+#define USB_REPLUG_DELAY_MS 8000
+
+static void usb_replug_bounce(void)
 {
     if (s_dongle) {
         return;
@@ -530,10 +635,23 @@ static void usb_replug_timer_cb(void *arg)
     ESP_LOGI(TAG, "dongle still absent, emulating one replug");
     if (usb_host_lib_set_root_port_power(false) == ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(200));
-        usb_host_lib_set_root_port_power(true);
-        ESP_LOGI(TAG, "root port power bounced (dongle not up)");
+        esp_err_t err = usb_host_lib_set_root_port_power(true);
+        if (err != ESP_OK) {
+            // No retry (see the rules above): the port stays unpowered until a reboot.
+            ESP_LOGE(TAG, "root port power-on failed (%s); dongle needs a reboot", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "root port power bounced (dongle not up)");
+        }
     }
 }
+
+static void usb_replug_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(USB_REPLUG_DELAY_MS));
+    usb_replug_bounce();
+    vTaskDelete(NULL);
+}
+#endif
 
 static void hid_interface_cb(hid_host_device_handle_t handle, const hid_host_interface_event_t event, void *arg)
 {
@@ -567,10 +685,16 @@ static void hid_interface_cb(hid_host_device_handle_t handle, const hid_host_int
     }
     case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Wyze dongle disconnected");
+        // Waits for an in-flight SET_REPORT in to_dongle_task. The driver frees the device
+        // after this callback returns, so the transfer must be finished by then. (Its
+        // completion is delivered by this same task, so a transfer to a vanished dongle ends
+        // by its 5 s timeout instead; that stalls the HID task once, but safely.)
+        xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
         if (handle == s_dongle) {
             s_dongle = NULL;
             s_dongle_gone = true;
         }
+        xSemaphoreGive(s_dongle_lock);
         hid_host_device_close(handle);
         break;
     case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
@@ -585,7 +709,9 @@ static void hid_driver_cb(hid_host_device_handle_t handle, const hid_host_driver
 {
     // Runs in the HID driver task: hand off to the app task.
     hid_driver_msg_t msg = {.handle = handle, .event = event};
-    xQueueSend(s_hid_driver_q, &msg, 0);
+    if (xQueueSend(s_hid_driver_q, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
+        ESP_LOGE(TAG, "HID driver event %d dropped (app task busy); replug the dongle", event);
+    }
 }
 
 static void usb_lib_task(void *arg)
@@ -609,19 +735,12 @@ static void usb_lib_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_ERROR_CHECK(usb_host_lib_set_root_port_power(true));
     ESP_LOGI(TAG, "root port power on");
-    const esp_timer_create_args_t replug_timer_args = {
-        .callback = usb_replug_timer_cb,
-        .name = "usb-replug",
-        .dispatch_method = ESP_TIMER_TASK,
-    };
-    esp_timer_handle_t replug_timer;
-    ESP_ERROR_CHECK(esp_timer_create(&replug_timer_args, &replug_timer));
     // +8 s after power-on: past debounce(300ms)+reset+recovery windows; the
-    // timer cb re-checks s_dongle before bouncing, so an on-time dongle skips it.
-    // esp_timer_start_once takes MICROSECONDS — a tick count here (800 us at
-    // 100 Hz) fires the bounce inside the settle window, recreating the exact
-    // race the delay was sized to avoid.
-    ESP_ERROR_CHECK(esp_timer_start_once(replug_timer, 8 * 1000000));
+    // task re-checks s_dongle before bouncing, so an on-time dongle skips it.
+    // Core 0 and a priority above this task's (2), like the esp_timer task it replaces.
+    if (xTaskCreatePinnedToCore(usb_replug_task, "usb_replug", 4096, NULL, 5, NULL, 0) != pdPASS) {
+        ESP_LOGE(TAG, "could not start the replug task; replug the dongle by hand if it does not come up");
+    }
 #endif
     while (true) {
         uint32_t flags;
@@ -630,6 +749,53 @@ static void usb_lib_task(void *arg)
             usb_host_device_free_all();
         }
     }
+}
+
+// Size in bytes of the Output report declared by a HID report descriptor, for a device without
+// report IDs (SET_REPORT goes out with report ID 0). Returns 0 when it can't tell: report IDs,
+// Push/Pop, or a truncated descriptor.
+static size_t hid_output_report_len(const uint8_t *d, size_t n)
+{
+    uint32_t size = 0, count = 0;
+    uint64_t bits = 0;
+    size_t i = 0;
+    while (i < n) {
+        const uint8_t b = d[i];
+        if (b == 0xFE) {  // long item: [0xFE][bDataSize][bLongItemTag][data]
+            if (i + 1 >= n) {
+                return 0;
+            }
+            i += 3 + d[i + 1];
+            continue;
+        }
+        const size_t len = (b & 3) == 3 ? 4 : (b & 3);
+        if (i + 1 + len > n) {
+            return 0;
+        }
+        uint32_t v = 0;
+        for (size_t k = 0; k < len; k++) {
+            v |= (uint32_t)d[i + 1 + k] << (8 * k);
+        }
+        switch (b & 0xFC) {
+        case 0x74:  // Report Size (global)
+            size = v;
+            break;
+        case 0x94:  // Report Count (global)
+            count = v;
+            break;
+        case 0x90:  // Output (main)
+            bits += (uint64_t)size * count;
+            break;
+        case 0x84:  // Report ID
+        case 0xA4:  // Push
+        case 0xB4:  // Pop
+            return 0;
+        default:
+            break;
+        }
+        i += 1 + len;
+    }
+    return bits > 8 * 0xFFFF ? 0xFFFF : (size_t)((bits + 7) / 8);
 }
 
 static void open_hid_device(hid_host_device_handle_t handle)
@@ -643,12 +809,37 @@ static void open_hid_device(hid_host_device_handle_t handle)
         ESP_LOGI(TAG, "ignoring HID device %04x:%04x", info.VID, info.PID);
         return;
     }
+    if (s_dongle) {
+        ESP_LOGW(TAG, "a Wyze dongle is already in use, ignoring the second one");
+        return;
+    }
     const hid_host_device_config_t dev_config = {.callback = hid_interface_cb, .callback_arg = NULL};
-    if (hid_host_device_open(handle, &dev_config) != ESP_OK || hid_host_device_start(handle) != ESP_OK) {
+    if (hid_host_device_open(handle, &dev_config) != ESP_OK) {
         ESP_LOGE(TAG, "failed to open Wyze dongle");
         return;
     }
+    if (hid_host_device_start(handle) != ESP_OK) {
+        ESP_LOGE(TAG, "failed to start Wyze dongle");
+        hid_host_device_close(handle);
+        return;
+    }
+    xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+    // The descriptor read is a control transfer: do it under the lock, like SET_REPORT, so a
+    // disconnect in the middle waits for it (see HID_HOST_INTERFACE_EVENT_DISCONNECTED). Called
+    // only once per device: usb_host_hid 1.0.4 keeps a failed read's buffer and returns it later.
+    size_t desc_len = 0;
+    const uint8_t *desc = hid_host_get_report_descriptor(handle, &desc_len);
+    size_t out_len = desc ? hid_output_report_len(desc, desc_len) : 0;
+    if (out_len == 0) {
+        ESP_LOGW(TAG, "dongle output report size unknown (descriptor %s, %u bytes); assuming %d",
+                 desc ? "not understood" : "unreadable", (unsigned)desc_len, HID_REPORT_LEN);
+        out_len = HID_REPORT_LEN;
+    } else {
+        ESP_LOGI(TAG, "dongle output report: %u bytes", (unsigned)out_len);
+    }
+    s_dongle_out_len = out_len;
     s_dongle = handle;  // s_dongle_gone stays set until the main loop recycles the WebSocket
+    xSemaphoreGive(s_dongle_lock);
     ESP_LOGI(TAG, "Wyze dongle up, connecting to gateway");
 }
 
@@ -659,12 +850,22 @@ static void to_dongle_task(void *arg)
         if (xQueueReceive(s_to_dongle_q, &f, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        hid_host_device_handle_t dev = s_dongle;
-        if (!dev) {
+        xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+        if (!s_dongle) {
+            xSemaphoreGive(s_dongle_lock);
+            continue;
+        }
+        if (f.len > s_dongle_out_len) {
+            // A SET_REPORT longer than the report can stall the dongle's control pipe.
+            const size_t limit = s_dongle_out_len;
+            xSemaphoreGive(s_dongle_lock);
+            ESP_LOGW(TAG, "gateway packet of %u bytes exceeds the dongle's %u-byte output report; not sent",
+                     f.len, (unsigned)limit);
             continue;
         }
         // Mirrors a Linux hidraw write on a device without an OUT endpoint.
-        esp_err_t err = hid_class_request_set_report(dev, HID_REPORT_TYPE_OUTPUT, 0, f.data, f.len);
+        esp_err_t err = hid_class_request_set_report(s_dongle, HID_REPORT_TYPE_OUTPUT, 0, f.data, f.len);
+        xSemaphoreGive(s_dongle_lock);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "SET_REPORT (%u bytes) failed: %s", f.len, esp_err_to_name(err));
         } else {
@@ -675,7 +876,8 @@ static void to_dongle_task(void *arg)
 
 // ---------------------------------------------------------------- WebSocket
 
-static frame_t s_rx;  // reassembly buffer for fragmented frames (WebSocket task only)
+static frame_t s_rx;     // reassembly buffer for fragmented messages (WebSocket task only)
+static bool s_rx_active;  // inside a binary message: continuation frames (opcode 0) belong to it
 
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -683,27 +885,41 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "gateway connected");
+        s_gateway_seen = true;  // the main loop confirms a new OTA image (ota_confirm_poll)
         xQueueReset(s_to_dongle_q);
+        s_rx_active = false;
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "gateway disconnected");
         break;
     case WEBSOCKET_EVENT_DATA:
-        if (ev->op_code != 0x02 && !(ev->op_code == 0x00 && s_rx.len > 0)) {
-            return;  // only binary frames carry protocol data
-        }
-        if (ev->payload_len > MAX_FRAME || ev->payload_offset + ev->data_len > MAX_FRAME) {
-            ESP_LOGW(TAG, "frame too large (%d bytes), dropped", ev->payload_len);
+        // Each WebSocket frame arrives as one or more chunks (payload_offset/data_len within
+        // payload_len); a message is one binary frame plus any continuation frames up to FIN.
+        // Control frames (ping/pong/close) may be interleaved and are skipped here.
+        if (ev->op_code == 0x02 && ev->payload_offset == 0) {
             s_rx.len = 0;
+            s_rx_active = true;
+        } else if (!s_rx_active || (ev->op_code != 0x02 && ev->op_code != 0x00)) {
+            if (ev->op_code == 0x01) {
+                s_rx_active = false;  // a text message: only binary frames carry protocol data
+            }
             return;
         }
-        memcpy(s_rx.data + ev->payload_offset, ev->data_ptr, ev->data_len);
-        s_rx.len = ev->payload_offset + ev->data_len;
-        if (s_rx.len >= ev->payload_len) {
+        if (s_rx.len + ev->data_len > MAX_FRAME) {
+            ESP_LOGW(TAG, "frame too large (> %d bytes), dropped", MAX_FRAME);
+            s_rx_active = false;
+            return;
+        }
+        memcpy(s_rx.data + s_rx.len, ev->data_ptr, ev->data_len);
+        s_rx.len += ev->data_len;
+        if (ev->fin && ev->payload_offset + ev->data_len >= ev->payload_len) {
+            s_rx_active = false;
+            if (s_rx.len == 0) {
+                return;  // an empty message is not a protocol packet
+            }
             if (xQueueSend(s_to_dongle_q, &s_rx, pdMS_TO_TICKS(100)) != pdTRUE) {
                 ESP_LOGW(TAG, "dongle queue full, dropped frame");
             }
-            s_rx.len = 0;
         }
         break;
     case WEBSOCKET_EVENT_ERROR:
@@ -714,12 +930,39 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     }
 }
 
+// Percent-encodes src for a URI query value (RFC 3986 unreserved characters pass through, so
+// typical alphanumeric tokens are sent unchanged). Returns false if out is too small.
+static bool url_encode(char *out, size_t size, const char *src)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t n = 0;
+    for (; *src; src++) {
+        const unsigned char c = (unsigned char)*src;
+        const bool plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                           c == '-' || c == '.' || c == '_' || c == '~';
+        if (n + (plain ? 1 : 3) >= size) {
+            return false;
+        }
+        if (plain) {
+            out[n++] = c;
+        } else {
+            out[n++] = '%';
+            out[n++] = hex[c >> 4];
+            out[n++] = hex[c & 0xF];
+        }
+    }
+    out[n] = '\0';
+    return true;
+}
+
 static void ws_start(void)
 {
-    static char uri[256];
+    static char uri[sizeof(s_cfg.uri) + 3 * (sizeof(s_cfg.token) - 1) + 48];
     const char *sep = strchr(s_cfg.uri, '?') ? "&" : "?";
     if (s_cfg.token[0]) {
-        snprintf(uri, sizeof(uri), "%s%sdevice=" BOARD_NAME "&token=%s", s_cfg.uri, sep, s_cfg.token);
+        char token[3 * (sizeof(s_cfg.token) - 1) + 1];
+        url_encode(token, sizeof(token), s_cfg.token);  // sized for the worst case: cannot fail
+        snprintf(uri, sizeof(uri), "%s%sdevice=" BOARD_NAME "&token=%s", s_cfg.uri, sep, token);
     } else {
         snprintf(uri, sizeof(uri), "%s%sdevice=" BOARD_NAME, s_cfg.uri, sep);
     }
@@ -730,15 +973,19 @@ static void ws_start(void)
         .buffer_size = 1024,
     };
     s_rx.len = 0;
-    s_ws = esp_websocket_client_init(&cfg);
-    if (!s_ws) {
+    s_rx_active = false;
+    esp_websocket_client_handle_t ws = esp_websocket_client_init(&cfg);
+    if (!ws) {
         // Only the console (which reboots) changes the URI: don't retry every 500 ms.
         ESP_LOGE(TAG, "invalid gateway URI \"%s\"; fix it on the console", s_cfg.uri);
         s_ws_bad_uri = true;
         return;
     }
-    esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
-    esp_websocket_client_start(s_ws);
+    esp_websocket_register_events(ws, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
+    esp_websocket_client_start(ws);
+    xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+    s_ws = ws;
+    xSemaphoreGive(s_ws_lock);
     ESP_LOGI(TAG, "connecting to %s", s_cfg.uri);
 }
 
@@ -747,9 +994,14 @@ static void ws_stop(void)
     if (!s_ws) {
         return;
     }
-    esp_websocket_client_stop(s_ws);
-    esp_websocket_client_destroy(s_ws);
+    // Unpublish under the lock: once it is held no other task is using the client, and
+    // afterwards none can pick it up, so destroying it outside the lock is safe.
+    xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+    esp_websocket_client_handle_t ws = s_ws;
     s_ws = NULL;
+    xSemaphoreGive(s_ws_lock);
+    esp_websocket_client_stop(ws);
+    esp_websocket_client_destroy(ws);
     ESP_LOGI(TAG, "gateway connection closed");
 }
 
@@ -760,34 +1012,136 @@ static void to_gateway_task(void *arg)
         if (xQueueReceive(s_to_gateway_q, &f, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        esp_websocket_client_handle_t ws = s_ws;
-        if (ws && esp_websocket_client_is_connected(ws)) {
-            if (esp_websocket_client_send_bin(ws, (const char *)f.data, f.len, pdMS_TO_TICKS(1000)) < 0) {
+        xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+        if (s_ws && esp_websocket_client_is_connected(s_ws)) {
+            if (esp_websocket_client_send_bin(s_ws, (const char *)f.data, f.len, pdMS_TO_TICKS(1000)) < 0) {
                 ESP_LOGW(TAG, "send to gateway failed");
             } else {
                 s_frames_up++;
             }
         }
+        xSemaphoreGive(s_ws_lock);
     }
 }
 
+// ---------------------------------------------------------------- OTA image confirmation
+
+// With CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE a freshly OTA'd image boots in PENDING_VERIFY, and
+// any reset before it is marked valid rolls back to the previous slot. It is marked valid once
+// the WebSocket to the gateway connects (dongle, network and gateway all work), not merely on an
+// IP. Bound: if the gateway has not connected OTA_CONFIRM_FALLBACK_US after the first IP of this
+// boot (gateway down or misconfigured, dongle unplugged), the image is kept anyway, so a gateway
+// problem never turns into a rollback. An image that never gets an IP is never confirmed.
+// The confirmation runs in the main loop, never in the WebSocket or event-loop tasks.
+#define OTA_CONFIRM_FALLBACK_US (5 * 60 * 1000000LL)
+
+static bool ota_pending_verify(void)
+{
+    esp_ota_img_states_t state;
+    return esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) == ESP_OK &&
+           state == ESP_OTA_IMG_PENDING_VERIFY;
+}
+
+// Called from the main loop while the image is pending. Returns true when done (confirmed, or
+// confirmation failed and was logged), false to be polled again.
+static bool ota_confirm_poll(net_kind_t net, int64_t *net_since_us)
+{
+    const char *why = NULL;
+    if (s_gateway_seen) {
+        why = "gateway connected";
+    } else if (net != NET_NONE) {
+        const int64_t now = esp_timer_get_time();
+        if (*net_since_us < 0) {
+            *net_since_us = now;
+        } else if (now - *net_since_us >= OTA_CONFIRM_FALLBACK_US) {
+            why = "no gateway connection 5 min after the network came up; keeping it anyway";
+        }
+    }
+    if (!why) {
+        return false;
+    }
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not mark this firmware valid (%s); the next reset rolls back", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "new firmware marked valid (%s)", why);
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------- HTTP: status, log, OTA
+
+// Compares without an early exit, so the time taken does not reveal how much of a guess matched.
+static bool token_equal(const char *given, const char *token)
+{
+    const size_t n = strlen(token);
+    const size_t m = strlen(given);
+    unsigned char diff = m != n;
+    for (size_t i = 0; i < n; i++) {
+        diff |= (unsigned char)((i < m ? given[i] : 0) ^ token[i]);
+    }
+    return diff == 0;
+}
+
+// Decodes %XX and '+' in a query value in place.
+static void url_decode(char *s)
+{
+    char *out = s;
+    for (; *s; s++) {
+        int hi, lo;
+        if (*s == '%' && sscanf(s + 1, "%1x%1x", &hi, &lo) == 2) {
+            *out++ = (char)(hi << 4 | lo);
+            s += 2;
+        } else {
+            *out++ = *s == '+' ? ' ' : *s;
+        }
+    }
+    *out = '\0';
+}
 
 // Accepts the bridge token as "Authorization: Bearer <token>" or ?token=<token>.
 static bool http_authorized(httpd_req_t *req)
 {
     if (!s_cfg.token[0]) {
+        // Open by default so a fresh flash can be updated before a token is set; builds with
+        // CONFIG_WYZE_REQUIRE_TOKEN refuse instead.
+#if CONFIG_WYZE_REQUIRE_TOKEN
+        return false;
+#else
         return true;
+#endif
     }
     char buf[96];
     if (httpd_req_get_hdr_value_str(req, "Authorization", buf, sizeof(buf)) == ESP_OK &&
-        strncmp(buf, "Bearer ", 7) == 0 && strcmp(buf + 7, s_cfg.token) == 0) {
+        strncmp(buf, "Bearer ", 7) == 0 && token_equal(buf + 7, s_cfg.token)) {
         return true;
     }
-    char query[128];
-    char token[72];
-    return httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-           httpd_query_key_value(query, "token", token, sizeof(token)) == ESP_OK && strcmp(token, s_cfg.token) == 0;
+    char query[256];
+    char token[200];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "token", token, sizeof(token)) != ESP_OK) {
+        return false;
+    }
+    url_decode(token);
+    return token_equal(token, s_cfg.token);
+}
+
+// Writes src as the contents of a JSON string (without quotes), truncating to fit.
+static void json_escape(char *out, size_t size, const char *src)
+{
+    size_t n = 0;
+    for (; *src && n + 7 < size; src++) {
+        const unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') {
+            out[n++] = '\\';
+            out[n++] = c;
+        } else if (c < 0x20) {
+            n += snprintf(out + n, size - n, "\\u%04x", c);
+        } else {
+            out[n++] = c;
+        }
+    }
+    out[n] = '\0';
 }
 
 static esp_err_t status_get(httpd_req_t *req)
@@ -798,17 +1152,20 @@ static esp_err_t status_get(httpd_req_t *req)
     if (net != NET_NONE) {
         esp_netif_get_ip_info(net == NET_ETH ? s_netif : s_wifi_netif, &ip);
     }
-    esp_websocket_client_handle_t ws = s_ws;
+    xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+    const bool ws_connected = s_ws && esp_websocket_client_is_connected(s_ws);
+    xSemaphoreGive(s_ws_lock);
     const bool eth_link = xEventGroupGetBits(s_events) & ETH_LINK_BIT;
-    char body[768];
+    char uri[2 * sizeof(s_cfg.uri)];
+    json_escape(uri, sizeof(uri), s_cfg.uri);
+    char body[1024];
     snprintf(body, sizeof(body),
              "{\"board\":\"" BOARD_NAME "\",\"version\":\"%s\",\"built\":\"%s %s\",\"uptime_s\":%lld,\"reset_reason\":%d,"
              "\"ip\":\"" IPSTR "\",\"gateway\":\"%s\",\"dongle\":%s,\"gateway_connected\":%s,"
              "\"network\":\"%s\",\"ethernet_link\":%s,\"wifi_fallback\":%s,"
              "\"frames_to_gateway\":%lu,\"frames_to_dongle\":%lu,\"free_heap\":%lu,\"partition\":\"%s\"}\n",
              app->version, app->date, app->time, esp_timer_get_time() / 1000000, esp_reset_reason(),
-             IP2STR(&ip.ip), s_cfg.uri, s_dongle ? "true" : "false",
-             (ws && esp_websocket_client_is_connected(ws)) ? "true" : "false",
+             IP2STR(&ip.ip), uri, s_dongle ? "true" : "false", ws_connected ? "true" : "false",
              net == NET_ETH ? "ethernet" : net == NET_WIFI ? "wifi" : "none", eth_link ? "true" : "false",
              s_wifi_netif ? "true" : "false",
              (unsigned long)s_frames_up,
@@ -820,27 +1177,30 @@ static esp_err_t status_get(httpd_req_t *req)
 
 static esp_err_t log_get(httpd_req_t *req)
 {
-    // Copy out under the lock, then send without holding it.
-    char *copy = malloc(LOG_BUF_SIZE);
-    if (!copy) {
-        return httpd_resp_send_500(req);
-    }
-    size_t len;
+    // Streamed in small chunks, each copied under the (interrupt-masking) spinlock and sent
+    // without it: no 48 KB allocation and no long critical section. Text that is overwritten
+    // while the response is being sent is skipped, never sent garbled.
+    char chunk[512];
     taskENTER_CRITICAL(&s_log_lock);
-    if (s_log_wrapped) {
-        size_t tail = LOG_BUF_SIZE - s_log_head;
-        memcpy(copy, s_log + s_log_head, tail);
-        memcpy(copy + tail, s_log, s_log_head);
-        len = LOG_BUF_SIZE;
-    } else {
-        memcpy(copy, s_log, s_log_head);
-        len = s_log_head;
-    }
+    const uint64_t end = s_log_written;
     taskEXIT_CRITICAL(&s_log_lock);
+    uint64_t pos = end > LOG_BUF_SIZE ? end - LOG_BUF_SIZE : 0;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    esp_err_t err = httpd_resp_send(req, copy, len);
-    free(copy);
-    return err;
+    while (pos < end) {
+        size_t n = 0;
+        taskENTER_CRITICAL(&s_log_lock);
+        if (s_log_written - pos > LOG_BUF_SIZE) {
+            pos = s_log_written - LOG_BUF_SIZE;  // the writer lapped us
+        }
+        while (pos < end && n < sizeof(chunk)) {
+            chunk[n++] = s_log[pos++ % LOG_BUF_SIZE];
+        }
+        taskEXIT_CRITICAL(&s_log_lock);
+        if (n > 0 && httpd_resp_send_chunk(req, chunk, n) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static void restart_task(void *arg)
@@ -854,6 +1214,12 @@ static esp_err_t ota_post(httpd_req_t *req)
     if (!http_authorized(req)) {
         httpd_resp_set_status(req, "401 Unauthorized");
         return httpd_resp_sendstr(req, "bad or missing token\n");
+    }
+    if (ota_pending_verify()) {
+        // esp_ota_begin() refuses this state (ESP_ERR_OTA_ROLLBACK_INVALID_STATE); say why.
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "running firmware is still on trial (confirmed once the gateway connects, "
+                                       "at most 5 min after the network is up); retry later\n");
     }
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part || req->content_len == 0 || req->content_len > part->size) {
@@ -872,12 +1238,13 @@ static esp_err_t ota_post(httpd_req_t *req)
     while (buf && remaining > 0) {
         int n = httpd_req_recv(req, buf, remaining < 4096 ? remaining : 4096);
         if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 3) {
-            continue;
+            continue;  // three timeouts in a row abort the upload
         }
         if (n <= 0) {
             err = ESP_FAIL;
             break;
         }
+        timeouts = 0;
         if (first && (uint8_t)buf[0] != 0xE9) {  // app images start with ESP_IMAGE_HEADER_MAGIC
             err = ESP_ERR_INVALID_ARG;
             break;
@@ -926,6 +1293,8 @@ static void http_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 6144;
     cfg.recv_wait_timeout = 10;
+    // Idle or slow clients cannot hold every socket: the least recently used one is closed.
+    cfg.lru_purge_enable = true;
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &cfg));
     const httpd_uri_t routes[] = {
@@ -957,7 +1326,9 @@ void app_main(void)
     console_setup();
 
     s_events = xEventGroupCreate();
-    s_hid_driver_q = xQueueCreate(4, sizeof(hid_driver_msg_t));
+    s_hid_driver_q = xQueueCreate(8, sizeof(hid_driver_msg_t));
+    s_dongle_lock = xSemaphoreCreateMutex();
+    s_ws_lock = xSemaphoreCreateMutex();
     s_to_gateway_q = xQueueCreate(16, sizeof(frame_t));
     s_to_dongle_q = xQueueCreate(16, sizeof(frame_t));
 
@@ -965,7 +1336,11 @@ void app_main(void)
     net_start();
     http_start();
     if (!s_cfg.token[0]) {
+#if CONFIG_WYZE_REQUIRE_TOKEN
+        ESP_LOGW(TAG, "no bridge token set: /ota and /reboot are disabled until one is set on the console");
+#else
         ESP_LOGW(TAG, "no bridge token set: /ota and /reboot are open to the whole LAN");
+#endif
     }
 
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, xTaskGetCurrentTaskHandle(), 2, NULL, 0);
@@ -990,6 +1365,12 @@ void app_main(void)
     uint32_t last_frames = UINT32_MAX;
     int wedged_polls = 0;
     net_kind_t ws_net = NET_NONE;
+    bool ota_pending = ota_pending_verify();
+    int64_t ota_net_since_us = -1;
+    if (ota_pending) {
+        ESP_LOGW(TAG, "new firmware on trial: kept once the gateway connects (at most 5 min after the "
+                      "network is up); a reset before that rolls back");
+    }
     while (true) {
         hid_driver_msg_t msg;
         if (xQueueReceive(s_hid_driver_q, &msg, pdMS_TO_TICKS(500)) == pdTRUE &&
@@ -997,11 +1378,16 @@ void app_main(void)
             open_hid_device(msg.handle);
         }
         const net_kind_t net = net_active();
+        if (ota_pending && ota_confirm_poll(net, &ota_net_since_us)) {
+            ota_pending = false;
+        }
         // A dongle that went away (even if already replugged) or a switch between
         // Ethernet and Wi-Fi ends the session: the gateway must redo its handshake,
         // and a socket bound to the old interface is dead anyway.
-        bool restart = s_dongle_gone;
+        xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+        const bool restart = s_dongle_gone;
         s_dongle_gone = false;
+        xSemaphoreGive(s_dongle_lock);
         if (s_ws && (restart || !s_dongle || net != ws_net)) {
             ws_stop();
         }

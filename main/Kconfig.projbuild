@@ -12,6 +12,14 @@ menu "Wyze ESP bridge"
         help
             Must match BRIDGE_AUTH_TOKEN on the gateway. Sent as the ?token= query parameter.
 
+    config WYZE_REQUIRE_TOKEN
+        bool "Refuse OTA and reboot requests while no bridge token is set"
+        default n
+        help
+            By default, POST /ota and POST /reboot are open to the whole network until a bridge
+            token is set (so a fresh flash can still be updated over the network). Enable this
+            to refuse them instead; set a token on the console to unlock them.
+
     config WYZE_WIFI_SSID
         string "WiFi SSID (baked default)"
         default ""

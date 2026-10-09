@@ -37,8 +37,8 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
 - **Ethernet is primary.** Once it has an IP (not merely a link — a cable into a dead port or a
   switch without DHCP doesn't count), Wi-Fi shuts off (`wifi stopped (ethernet is primary)`).
 - **Wi-Fi is a fallback** (when an SSID is configured): at boot it starts if Ethernet has no IP
-  within 8 s, starts ~1 s after the link drops, retries every 5 s, and stops when Ethernet has an
-  IP again. Never both in use at once. Boards without Ethernet hardware go straight to Wi-Fi.
+  within 8 s, starts ~1 s after the link drops (or after Ethernet loses its DHCP address), retries
+  every 5 s, and stops when Ethernet has an IP again. Never both in use at once. Boards without Ethernet hardware go straight to Wi-Fi.
 - The WebSocket stays open only while the dongle is plugged in **and** a network is up. Switching
   between Ethernet and Wi-Fi, or replugging the dongle, recycles the gateway session. A wedged
   WebSocket client is detected and rebuilt (~2 min watchdog).
@@ -60,15 +60,20 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
    - your gateway URI (e.g. `ws://192.168.1.50:8080/ws/bridge`)
    - your bridge token, matching the gateway's `bridge.auth_token` (masked input; Enter keeps the currently stored value)
    - Wi-Fi SSID and password (leave SSID blank for pure-Ethernet operation)
-   
-   Values are stored in NVS and survive reboots and OTA updates. If you leave the defaults baked into
-   `sdkconfig.defaults` (edit + rebuild yourself), setup is skipped entirely.
+
+   At every prompt, Enter keeps the value in brackets and `-` clears it (e.g. `-` at the SSID
+   prompt turns Wi-Fi off). A prompt left unanswered for 60 s cancels setup without saving, and the
+   board boots normally.
+
+   Values are stored in NVS and survive reboots and OTA updates. If you bake your values in at build
+   time instead (`sdkconfig.local.defaults`, see [Build from source](#build-from-source)), just let
+   the 3 s prompt time out.
 5. The board boots into `waiting for Wyze dongle`; plug the dongle into the USB-A port (sold with
    your Wyze system, the little USB-A stick), and you'll see:
    ```
-   wyze-esp-bridge 2.2.4 (esp32p4-eth)
+   wyze-esp-bridge 2.4.0 (esp32p4-eth)
    ...
-   network up (wifi fallback), IP 192.168.x.x     <- if no ethernet cable
+   network up (wifi), IP 192.168.x.x     <- if no ethernet cable
    Wyze dongle up, connecting to gateway
    gateway connected
    ```
@@ -83,12 +88,15 @@ WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
 The setup prompt asks for a Wi-Fi SSID and password at the same time as the gateway settings:
 
 - **SSID + password stored → the board uses Ethernet when the cable is in, and Wi-Fi when it's out.**
-- **Leave SSID blank → Wi-Fi stays off entirely** (pure-Ethernet board, like before v2.2).
+- **Leave SSID blank (or enter `-` to clear a stored one) → Wi-Fi stays off entirely** (pure-Ethernet
+  board, like before v2.2).
 - The Wi-Fi runs on the board's ESP32-C6 co-processor over SDIO (ESP-Hosted). A factory C6 firmware
   prints `esp-hosted fw versions: host=3.x coprocessor=0.0.0`+`major version mismatch` at boot —
   harmless (association + data path work); updating the C6 firmware via esp-usb/esp-hosted OTA is
   on the roadmap. Currently 2.4 GHz only (C6 limit).
-- Wi-Fi connect failures retry every 5 s; association works with WPA1/WPA2/WPA3-mixed and open APs.
+- Wi-Fi connect failures retry every 5 s; association works with WPA1/WPA2/WPA3-mixed APs, and with
+  open APs only when no password is set (with a password set, an open AP using the same SSID is
+  refused).
 
 A useful debugging window between resets: board `/status` over Wi-Fi can be flaky in dual-homed
 LANs (some APs isolate clients); the **gateway's dashboard is the source of truth** for whether a
@@ -106,24 +114,73 @@ pipx run esptool --chip esp32p4 -p /dev/ttyACM0 chip_id
 - Chip revision `v0.x`/`v1.x` (e.g. `v1.3`) → use `wyze-esp-bridge-p4-rev1-*.bin`
 
 Current `PARTITION` is printed in `/status`; the board has 16 MB flash and two 3 MB OTA slots. OTA
-rollback is armed: a new image only sticks if it reaches the network (gets an IP); otherwise the next
-reset rolls back to the previous slot.
+rollback is armed: a new image is on trial until its WebSocket connection to the gateway comes up,
+and any reset before that (crash, watchdog, `/reboot`, saving settings on the console) rolls back to
+the previous slot. If the gateway has not connected 5 minutes after the network came up (gateway
+down or misconfigured, dongle unplugged), the image is kept anyway, so a gateway problem never
+causes a rollback. An image that never gets an IP is never kept. While an image is on trial,
+`POST /ota` answers `503` (ESP-IDF cannot start another update before the running one is confirmed).
 
 ### OTA updates (once the bridge is online)
 
-```bash
-python3 - <<'EOF'
-import urllib.request
-token = "CHANGE_ME"  # your bridge token
-with open("wyze-esp-bridge-p4-rev1-ota.bin","rb") as f: data = f.read()
-req = urllib.request.Request("http://<board-ip>/ota", data=data, method="POST",
-    headers={"Authorization": f"Bearer {token}"})
-print(urllib.request.urlopen(req, timeout=180).read().decode())
-EOF
-```
+Updates go over the network to `POST /ota`; no USB cable needed after the first flash.
+
+1. **Pick the right image.** Use the same variant you flashed first (see
+   [Firmware variants](#firmware-variants)): `p4` for chip v3.x, `p4-rev1` for v0.x/v1.x, `s3-eth`
+   for the S3 board. A wrong-variant image is rejected by the bridge (`500`) and nothing changes.
+
+2. **Download it and check it.** From the [latest release](https://github.com/rainyvalley/wyze-esp-bridge/releases/latest),
+   grab the `-ota.bin` for your variant and `SHA256SUMS`:
+
+   ```bash
+   V=p4-rev1   # or p4 / s3-eth
+   gh release download -R rainyvalley/wyze-esp-bridge -p "wyze-esp-bridge-$V-ota.bin" -p SHA256SUMS
+   sha256sum --check --ignore-missing SHA256SUMS
+   ```
+
+   (Without `gh`: download the same two files from the release page in a browser.)
+
+3. **Note what's running now,** so you can tell the update took:
+
+   ```bash
+   curl -s http://<board-ip>/status   # "version", "built", "partition"
+   ```
+
+4. **Upload.** Use the bridge token you set on the console (leave the header out if none is set):
+
+   ```bash
+   curl --fail-with-body -H "Authorization: Bearer <token>" \
+        --data-binary @wyze-esp-bridge-$V-ota.bin http://<board-ip>/ota
+   ```
+
+   Takes 10–30 s and answers `ok, rebooting`. The bridge restarts into the other OTA slot.
+
+5. **Check it came back.** After ~20 s (P4: the dongle takes ~16 s to enumerate):
+
+   ```bash
+   curl -s http://<board-ip>/status   # new "version", the other "partition", "gateway_connected": true
+   ```
+
+   The new image is **on trial** until it connects to the gateway (or 5 minutes pass with the
+   network up). `GET /log` shows `new firmware marked valid` once it is kept. Don't reboot or
+   power-cycle it before then: a reset during the trial rolls back to the previous version.
+
+| Response | Meaning |
+|---|---|
+| `ok, rebooting` | Image written and verified; the bridge restarts into it |
+| `401 bad or missing token` | Wrong or missing `Authorization: Bearer` token |
+| `503 … still on trial` | The current image isn't confirmed yet; wait for the gateway to connect (≤5 min) and retry |
+| `400 missing or oversized image` | Empty upload or wrong file (use `-ota.bin`, not `-merged.bin`) |
+| `500 <error>` | Image rejected, e.g. wrong chip variant or corrupt download; the running firmware is untouched |
+
+If the bridge comes back on the old version, the new image was rolled back: check `GET /log`.
 
 HTTP endpoints: `GET /status` (JSON), `GET /log` (this boot's ring buffer), `POST /ota` (token),
-`POST /reboot` (token). Token can also be `?token=` query-param.
+`POST /reboot` (token). Token can also be `?token=` query-param (percent-encoded).
+
+`/status` and `/log` need no token. Values of `token=` are masked in the log. **While no token is
+set, `/ota` and `/reboot` are open to anyone on the network**: set a token on the console, or build
+with `CONFIG_WYZE_REQUIRE_TOKEN=y` to refuse them until one is set.
 
 ## Build from source
 
@@ -144,13 +201,23 @@ docker run --rm -v "$PWD":/project -w /project espressif/idf:release-v5.5 \
   set-target esp32p4 reconfigure build
 ```
 
-Every release binary on this repo is built by CI from that exact command.
+Every release binary on this repo is built by CI with `./build.sh` (all variants) in the same
+container image, pinned by digest in `.github/workflows/release.yml`; releases include `SHA256SUMS`.
+
+Site-specific values (gateway URI, token, Wi-Fi credentials) can be baked in through a git-ignored
+`sdkconfig.local.defaults`, which `build.sh` appends when present. Images built that way contain
+those secrets in plain text: never share or upload them.
+
+Component versions are locked per target in `dependencies.lock.esp32p4` and
+`dependencies.lock.esp32s3`.
 
 ## Protocol notes
 
 - Dongle → gateway: HID input report `[len][data…]`, forward `data[0..len]` as one binary WS frame.
 - Gateway → dongle: one binary WS frame = one protocol packet, sent as HID
-  `SET_REPORT` (Output, report ID 0) — the dongle has no interrupt OUT endpoint.
+  `SET_REPORT` (Output, report ID 0) — the dongle has no interrupt OUT endpoint. A packet larger
+  than the dongle's output report (read from its HID report descriptor at plug-in and logged as
+  `dongle output report: N bytes`; 64 if the descriptor can't be read) is dropped with a log line.
 - Auth: `?token=<bridge token>` query parameter plus `device=<BOARD_NAME>`, per the gateway's
   [`multi_dongle_design.md`](https://github.com/HclX/wyzesense2mqtt-rs/blob/main/docs/multi_dongle_design.md).
 - The WebSocket stays open only while the dongle is plugged in and the network is up, so the gateway
@@ -164,7 +231,8 @@ Every release binary on this repo is built by CI from that exact command.
   settle bounce plus a one-shot replug emulation (8 s after power-on) recovers it. If the dongle
   never comes up, unplug/replug it once.
 - **`StaDisconnected reason=211`** — the Wi-Fi scan threshold filtered your AP (older builds);
-  v2.2.2+ uses an open scan threshold. Reason 202 = wrong password.
+  v2.2.2+ uses the weakest PSK threshold (WPA) when a password is set, open otherwise. Reason 202 =
+  wrong password.
 - **`esp-hosted fw versions ... major version mismatch`** — the factory C6 co-processor firmware;
   benign, Wi-Fi still works.
 - **Boot-loop on older P4 revisions with the dongle pre-powered** — fixed since v2.0.8
