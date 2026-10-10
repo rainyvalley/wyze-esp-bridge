@@ -1,0 +1,21 @@
+# Advisory style, close to ESP-IDF's own (docs/api-guides/style-guide): LLVM base,
+# 4-space indent, 120 columns, no tabs. Enforced in CI only as a dry-run advisory
+# (continue-on-error) until the codebase is reformatted on purpose.
+---
+BasedOnStyle: LLVM
+IndentWidth: '4'
+ColumnLimit: '120'
+UseTab: Never
+ReflowComments: 'true'
+PointerAlignment: Right
+AlignAfterOpenBracket: Align
+SortIncludes: false
+IncludeBlocks: Preserve
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+BreakBeforeBraces: Attach
+SpaceBeforeParens: ControlStatements
+FixNamespaceComments: false
+
+# C11
+Standard: c++11

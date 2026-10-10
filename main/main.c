@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "util.h"
+
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
@@ -97,31 +99,10 @@ static char s_log[LOG_BUF_SIZE];
 static uint64_t s_log_written;  // total bytes ever written; s_log[s_log_written % LOG_BUF_SIZE] is next
 static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
 
-// Masks the value of every "token=" in a log line. The gateway URI carries the bridge token in
-// its query string, and component code (e.g. the WebSocket client's "Error parse uri = %s")
-// may log that URI; /log is served without auth.
-static bool log_redact_token(char *line)
-{
-    bool redacted = false;
-    for (char *p = strstr(line, "token="); p; p = strstr(p, "token=")) {
-        p += 6;
-        char *end = p;
-        while (*end && *end != '&' && *end != '"' && *end != ' ' && *end != '\r' && *end != '\n') {
-            end++;
-        }
-        if (end - p >= 3) {
-            memmove(p + 3, end, strlen(end) + 1);  // shrinks or keeps the length: never overflows
-            memcpy(p, "***", 3);
-            p += 3;
-            redacted = true;
-        } else if (end > p) {
-            memset(p, '*', end - p);
-            p = end;
-            redacted = true;
-        }
-    }
-    return redacted;
-}
+// Masks the value of every "token=" in a log line before it reaches the ring or the UART
+// (log_redact_token, in util.c): the gateway URI carries the bridge token in its query
+// string, and component code (e.g. the WebSocket client's "Error parse uri = %s") may log
+// that URI; /log is served without auth.
 
 static int log_vprintf(const char *fmt, va_list args)
 {
@@ -785,52 +766,8 @@ static void usb_lib_task(void *arg)
     }
 }
 
-// Size in bytes of the Output report declared by a HID report descriptor, for a device without
-// report IDs (SET_REPORT goes out with report ID 0). Returns 0 when it can't tell: report IDs,
-// Push/Pop, or a truncated descriptor.
-static size_t hid_output_report_len(const uint8_t *d, size_t n)
-{
-    uint32_t size = 0, count = 0;
-    uint64_t bits = 0;
-    size_t i = 0;
-    while (i < n) {
-        const uint8_t b = d[i];
-        if (b == 0xFE) {  // long item: [0xFE][bDataSize][bLongItemTag][data]
-            if (i + 1 >= n) {
-                return 0;
-            }
-            i += 3 + d[i + 1];
-            continue;
-        }
-        const size_t len = (b & 3) == 3 ? 4 : (b & 3);
-        if (i + 1 + len > n) {
-            return 0;
-        }
-        uint32_t v = 0;
-        for (size_t k = 0; k < len; k++) {
-            v |= (uint32_t)d[i + 1 + k] << (8 * k);
-        }
-        switch (b & 0xFC) {
-        case 0x74:  // Report Size (global)
-            size = v;
-            break;
-        case 0x94:  // Report Count (global)
-            count = v;
-            break;
-        case 0x90:  // Output (main)
-            bits += (uint64_t)size * count;
-            break;
-        case 0x84:  // Report ID
-        case 0xA4:  // Push
-        case 0xB4:  // Pop
-            return 0;
-        default:
-            break;
-        }
-        i += 1 + len;
-    }
-    return bits > 8 * 0xFFFF ? 0xFFFF : (size_t)((bits + 7) / 8);
-}
+// Output report size comes from the dongle's report descriptor (hid_output_report_len, in
+// util.c), with HID_REPORT_LEN as the fallback when it can't be read or understood.
 
 static void open_hid_device(hid_host_device_handle_t handle)
 {
@@ -964,31 +901,6 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     }
 }
 
-// Percent-encodes src for a URI query value (RFC 3986 unreserved characters pass through, so
-// typical alphanumeric tokens are sent unchanged). Returns false if out is too small.
-static bool url_encode(char *out, size_t size, const char *src)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    size_t n = 0;
-    for (; *src; src++) {
-        const unsigned char c = (unsigned char)*src;
-        const bool plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                           c == '-' || c == '.' || c == '_' || c == '~';
-        if (n + (plain ? 1 : 3) >= size) {
-            return false;
-        }
-        if (plain) {
-            out[n++] = c;
-        } else {
-            out[n++] = '%';
-            out[n++] = hex[c >> 4];
-            out[n++] = hex[c & 0xF];
-        }
-    }
-    out[n] = '\0';
-    return true;
-}
-
 static void ws_start(void)
 {
     static char uri[sizeof(s_cfg.uri) + 3 * (sizeof(s_cfg.token) - 1) + 48];
@@ -1105,34 +1017,6 @@ static bool ota_confirm_poll(net_kind_t net, int64_t *net_since_us)
 
 // ---------------------------------------------------------------- HTTP: status, log, OTA
 
-// Compares without an early exit, so the time taken does not reveal how much of a guess matched.
-static bool token_equal(const char *given, const char *token)
-{
-    const size_t n = strlen(token);
-    const size_t m = strlen(given);
-    unsigned char diff = m != n;
-    for (size_t i = 0; i < n; i++) {
-        diff |= (unsigned char)((i < m ? given[i] : 0) ^ token[i]);
-    }
-    return diff == 0;
-}
-
-// Decodes %XX and '+' in a query value in place.
-static void url_decode(char *s)
-{
-    char *out = s;
-    for (; *s; s++) {
-        int hi, lo;
-        if (*s == '%' && sscanf(s + 1, "%1x%1x", &hi, &lo) == 2) {
-            *out++ = (char)(hi << 4 | lo);
-            s += 2;
-        } else {
-            *out++ = *s == '+' ? ' ' : *s;
-        }
-    }
-    *out = '\0';
-}
-
 // Accepts the bridge token as "Authorization: Bearer <token>" or ?token=<token>.
 static bool http_authorized(httpd_req_t *req)
 {
@@ -1158,24 +1042,6 @@ static bool http_authorized(httpd_req_t *req)
     }
     url_decode(token);
     return token_equal(token, s_cfg.token);
-}
-
-// Writes src as the contents of a JSON string (without quotes), truncating to fit.
-static void json_escape(char *out, size_t size, const char *src)
-{
-    size_t n = 0;
-    for (; *src && n + 7 < size; src++) {
-        const unsigned char c = (unsigned char)*src;
-        if (c == '"' || c == '\\') {
-            out[n++] = '\\';
-            out[n++] = c;
-        } else if (c < 0x20) {
-            n += snprintf(out + n, size - n, "\\u%04x", c);
-        } else {
-            out[n++] = c;
-        }
-    }
-    out[n] = '\0';
 }
 
 static esp_err_t status_get(httpd_req_t *req)

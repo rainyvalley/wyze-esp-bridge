@@ -1,0 +1,8 @@
+Vendored from github.com/ThrowTheSwitch/Unity at tag v2.6.1
+(commit cbcd08fa7de711053a3deec6339ee89cad5d2697), MIT-licensed
+(SPDX-License-Identifier: MIT in each file, as shipped upstream).
+Files: unity.c, unity.h, unity_internals.h (unchanged).
+sha256:
+b90e735a54cf3b3765ab6caa955d11a1488ee73d9c6152cdc98576c2d17cb871  unity.c
+9db174d3c2c6424fd35c0980c5941d124c5ebb0f48e8172f997a2aa9554b64ea  unity.h
+fcd8b3f6b412ac0ab599547eb8a30b6d7f3f0af77aab31f7a1822a2a8fc9a2b2  unity_internals.h

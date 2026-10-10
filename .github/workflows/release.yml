@@ -8,12 +8,89 @@ on:
   # before they reach main.
   pull_request:
   workflow_dispatch:
+  # Weekly component-drift check: one variant is rebuilt after deleting
+  # managed_components/, so the ESP component registry re-resolves everything
+  # (see the build job's "Prepare scheduled component-drift check" step).
+  schedule:
+    - cron: '47 4 * * 1'
 
 # Read-only by default; only the release job (tags only) can write to the repository.
 permissions:
   contents: read
 
 jobs:
+  # Shell/yaml lint. advisory clang-format check included (dry-run, non-gating) until
+  # the codebase is reformatted on purpose.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned toolchain (actionlint)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/actionlint.tgz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tgz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
+
+      - name: shellcheck build.sh
+        run: shellcheck -s sh build.sh
+
+      - name: actionlint release.yml
+        run: /tmp/actionlint -no-color -- .github/workflows/release.yml
+
+      - name: hadolint (no Dockerfile yet)
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "a Dockerfile appeared: lint it (add hadolint pinned to this job)"
+            hadolint Dockerfile
+          else
+            echo "no Dockerfile in the repo; skipped"
+          fi
+
+      - name: clang-format advisory check
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq clang-format
+          clang-format --dry-run --Werror main/util.c main/util.h
+  # Host unit tests for main/util.c, run in the same pinned IDF container as the
+  # build (its gcc toolchain compiles them). Sibling of `build`; both gate `release`.
+  tests:
+    runs-on: ubuntu-latest
+    container:
+      # release-v5.5, pinned by digest so release builds are reproducible. Bump deliberately.
+      image: espressif/idf:release-v5.5@sha256:cb51f78629a9656e8823dd6f751d309968e88d3e2806d50bd99eac1ae6245f74
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build and run host unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # -Werror so a warning can never slip in as "just noise" here.
+          flags="-std=c11 -Wall -Wextra -Werror"
+          # Keep the sanitizers when the container has the runtime; fall back to a
+          # plain build rather than failing on images without libasan.
+          if printf 'int main(void){return 0;}' > /tmp/probe.c &&
+             cc "$flags" -fsanitize=address,undefined /tmp/probe.c -o /tmp/probe 2>/dev/null &&
+             /tmp/probe; then
+            flags="$flags -fsanitize=address,undefined"
+          else
+            echo "sanitizer runtime unavailable in this image; running without it"
+          fi
+          rm -rf /tmp/build && mkdir -p /tmp/build     # keep build/ out of the checkout
+          cc "$flags" -Imain -Itests/host/unity \
+             tests/host/unit.c main/util.c tests/host/unity/unity.c -o /tmp/build/unit
+          /tmp/build/unit
+
   build:
     runs-on: ubuntu-latest
     container:
@@ -25,12 +102,69 @@ jobs:
         with:
           persist-credentials: false
 
+      # Release guard (tag builds only): the app version is PROJECT_VER in CMakeLists.txt
+      # (not derived from git), and the two must stay in step for the GitHub release.
+      - name: Verify PROJECT_VER matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^set(PROJECT_VER "\([^"]*\)")$/\1/p' CMakeLists.txt | head -1)
+          want=${GITHUB_REF_NAME#v}
+          if [ -z "$ver" ]; then
+            echo "::error::set(PROJECT_VER \"...\") not found in CMakeLists.txt"
+            exit 1
+          fi
+          if [ "$ver" != "$want" ]; then
+            echo "::error::PROJECT_VER '$ver' != tag '$GITHUB_REF_NAME' (expected '$want'); bump CMakeLists.txt"
+            exit 1
+          fi
+
       - name: Build all board variants
         shell: bash
         run: |
-          source /opt/esp/idf/export.sh
-          ./build.sh
-          (cd out && sha256sum *.bin > SHA256SUMS)
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
+            echo "Scheduled run: deleting managed_components/ to force a fresh component fetch"
+            rm -rf managed_components
+            # One variant (the p4 one, no extra defaults) is enough to catch upstream
+            # component breakage; the full set is only needed to publish an image.
+            ./build.sh p4 esp32p4
+          else
+            ./build.sh
+          fi
+          (cd ./out && sha256sum ./*.bin > SHA256SUMS)
+
+      # Release guard (tag builds only): each OTA image must fit its 3 MB ota_x
+      # partition with 96 KB of headroom (spare descriptor/padding slack), or the
+      # board's OTA update would be rejected — better to fail the release than to
+      # publish an image that can't install.
+      - name: Check OTA image sizes
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # "ota_0,    app,  ota_0,   0x20000,  0x300000": split on commas, strip
+          # spaces, then let bash arithmetic turn the hex size into a decimal number.
+          slot_hex=$(awk -F, '$1 ~ /^ota_0$/ {gsub(/[[:space:]]/, "", $5); print $5}' partitions.csv)
+          if [ -z "$slot_hex" ]; then
+            echo "::error::could not read the ota_0 size from partitions.csv"
+            exit 1
+          fi
+          slot_bytes=$((slot_hex))
+          headroom=$((96 * 1024))
+          limit=$((slot_bytes - headroom))
+          echo "ota_0 slot: $slot_bytes bytes; OTA image limit: $limit bytes"
+          fail=0
+          for f in "./out/"*-ota.bin; do
+            sz=$(stat -c%s "$f")
+            echo "$f: $sz bytes"
+            if [ "$sz" -gt "$limit" ]; then
+              echo "::error::$f is $sz bytes, over the $limit-byte OTA limit (ota_0 partition $slot_bytes minus $headroom headroom)"
+              fail=1
+            fi
+          done
+          exit $fail
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -42,7 +176,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, tests]
     runs-on: ubuntu-latest
     permissions:
       contents: write
