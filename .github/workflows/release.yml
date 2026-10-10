@@ -87,7 +87,9 @@ jobs:
             echo "sanitizer runtime unavailable in this image; running without it"
           fi
           rm -rf /tmp/build && mkdir -p /tmp/build     # keep build/ out of the checkout
-          cc "$flags" -Imain -Itests/host/unity \
+          # $flags unquoted on purpose: quoted, bash passes the whole flag set
+          # to cc as ONE argument and cc rejects it.
+          cc $flags -Imain -Itests/host/unity \
              tests/host/unit.c main/util.c tests/host/unity/unity.c -o /tmp/build/unit
           /tmp/build/unit
 
@@ -124,6 +126,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # idf.py is only on PATH after the IDF env is exported; the image's
+          # entrypoint does it for interactive shells, GHA job steps don't.
+          source /opt/esp/idf/export.sh
           if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
             echo "Scheduled run: deleting managed_components/ to force a fresh component fetch"
             rm -rf managed_components
