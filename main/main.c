@@ -137,11 +137,12 @@ static int log_vprintf(const char *fmt, va_list args)
     const size_t len = strlen(line);
     taskENTER_CRITICAL(&s_log_lock);
     size_t idx = s_log_written % LOG_BUF_SIZE;
-    for (size_t i = 0; i < len; i++) {
-        s_log[idx++] = line[i];
-        if (idx == LOG_BUF_SIZE) {
-            idx = 0;
-        }
+    const size_t contig = LOG_BUF_SIZE - idx;
+    if (len <= contig) {
+        memcpy(s_log + idx, line, len);
+    } else {
+        memcpy(s_log + idx, line, contig);
+        memcpy(s_log, line + contig, len - contig);
     }
     s_log_written += len;
     taskEXIT_CRITICAL(&s_log_lock);
@@ -599,8 +600,11 @@ static void wifi_init(bool have_eth)
     ESP_ERROR_CHECK(esp_netif_set_hostname(netif, HOSTNAME));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     wifi_config_t sta_cfg = {0};
-    strlcpy((char *)sta_cfg.sta.ssid, s_cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid));
-    strlcpy((char *)sta_cfg.sta.password, s_cfg.wifi_pass, sizeof(sta_cfg.sta.password));
+    // memcpy, not strlcpy: the ssid/password fields are 32/64 bytes, one less than our config
+    // buffers, so strlcpy would cut a legal 32-char SSID / 64-char password to 31/63. The struct
+    // is zeroed, so the remainder already terminates short values; a full 32-byte SSID is valid.
+    memcpy(sta_cfg.sta.ssid, s_cfg.wifi_ssid, strnlen(s_cfg.wifi_ssid, sizeof(sta_cfg.sta.ssid)));
+    memcpy(sta_cfg.sta.password, s_cfg.wifi_pass, strnlen(s_cfg.wifi_pass, sizeof(sta_cfg.sta.password)));
     // Scan threshold: WPA_PSK is the weakest PSK mode, so WPA/WPA2/WPA3-mixed APs still pass
     // (a stricter threshold gives reason 211, NO_AP_FOUND_IN_AUTHMODE_THRESHOLD). It must not
     // be OPEN when a password is set: an open AP spoofing the SSID never asks for the password,
@@ -1188,6 +1192,10 @@ static esp_err_t status_get(httpd_req_t *req)
     const bool eth_link = xEventGroupGetBits(s_events) & ETH_LINK_BIT;
     char uri[2 * sizeof(s_cfg.uri)];
     json_escape(uri, sizeof(uri), s_cfg.uri);
+    // Mask any token= embedded in the gateway URI, same convention as the /log stream:
+    // /status is served without auth. json_escape cannot introduce a "token=" substring
+    // and escapes an embedded credential only where it already reads as one in the URI.
+    log_redact_token(uri);
     char body[1024];
     snprintf(body, sizeof(body),
              "{\"board\":\"" BOARD_NAME "\",\"version\":\"%s\",\"built\":\"%s %s\",\"uptime_s\":%lld,\"reset_reason\":%d,"
@@ -1217,13 +1225,22 @@ static esp_err_t log_get(httpd_req_t *req)
     uint64_t pos = end > LOG_BUF_SIZE ? end - LOG_BUF_SIZE : 0;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
     while (pos < end) {
-        size_t n = 0;
+        size_t n;
         taskENTER_CRITICAL(&s_log_lock);
         if (s_log_written - pos > LOG_BUF_SIZE) {
             pos = s_log_written - LOG_BUF_SIZE;  // the writer lapped us
         }
-        while (pos < end && n < sizeof(chunk)) {
-            chunk[n++] = s_log[pos++ % LOG_BUF_SIZE];
+        n = end > pos ? (size_t)(end - pos) : 0;
+        const size_t contig = LOG_BUF_SIZE - (size_t)(pos % LOG_BUF_SIZE);
+        if (n > contig) {
+            n = contig;                        // stop at the buffer wrap
+        }
+        if (n > sizeof(chunk)) {
+            n = sizeof(chunk);                 // stop at the chunk size
+        }
+        if (n > 0) {
+            memcpy(chunk, s_log + (pos % LOG_BUF_SIZE), n);
+            pos += n;
         }
         taskEXIT_CRITICAL(&s_log_lock);
         if (n > 0 && httpd_resp_send_chunk(req, chunk, n) != ESP_OK) {
