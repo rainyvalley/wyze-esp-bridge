@@ -76,20 +76,23 @@ jobs:
         run: |
           set -euo pipefail
           # -Werror so a warning can never slip in as "just noise" here.
-          flags="-std=c11 -Wall -Wextra -Werror"
+          # An array, not a string: "${flags[@]}" is shellcheck-clean, and a
+          # string form either fails cc (quoted = one giant argument) or
+          # trips SC2086 (unquoted) in the actionlint/shellcheck lint job.
+          flags=(-std=c11 -Wall -Wextra -Werror)
           # Keep the sanitizers when the container has the runtime; fall back to a
-          # plain build rather than failing on images without libasan.
+          # plain build rather than failing on images without libasan. Two
+          # separate -fsanitize flags (not one comma-joined argument): a comma
+          # inside an array element trips shellcheck's SC2054 in the lint job.
           if printf 'int main(void){return 0;}' > /tmp/probe.c &&
-             cc "$flags" -fsanitize=address,undefined /tmp/probe.c -o /tmp/probe 2>/dev/null &&
+             cc "${flags[@]}" -fsanitize=address -fsanitize=undefined /tmp/probe.c -o /tmp/probe 2>/dev/null &&
              /tmp/probe; then
-            flags="$flags -fsanitize=address,undefined"
+            flags+=(-fsanitize=address -fsanitize=undefined)
           else
             echo "sanitizer runtime unavailable in this image; running without it"
           fi
           rm -rf /tmp/build && mkdir -p /tmp/build     # keep build/ out of the checkout
-          # $flags unquoted on purpose: quoted, bash passes the whole flag set
-          # to cc as ONE argument and cc rejects it.
-          cc $flags -Imain -Itests/host/unity \
+          cc "${flags[@]}" -Imain -Itests/host/unity \
              tests/host/unit.c main/util.c tests/host/unity/unity.c -o /tmp/build/unit
           /tmp/build/unit
 
