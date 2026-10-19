@@ -260,6 +260,10 @@ Component versions are locked per target in `dependencies.lock.esp32p4` and
 snap-fit or M2.5 screws). Previews in `case/*.png`. See comments in the `.scad` file for print settings
 and `MEASURE`-marked values. `case/wyze_esp_bridge_case.scad` is for an earlier (obsolete) S3 build.
 
+## A note on AI assistance
+
+Parts of this project — code, configuration, and documentation — were written with the help of generative AI. Everything in here was reviewed, tested, and corrected by a human before being committed; nothing was accepted on the model's say-so.
+
 ## License
 
 [MIT](LICENSE)
