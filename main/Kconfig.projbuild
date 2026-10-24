@@ -4,13 +4,13 @@ menu "Wyze ESP bridge"
         string "Gateway WebSocket URI"
         default "ws://192.168.1.10:8080/ws/bridge"
         help
-            wyzesense2mqtt-rs bridge endpoint. Can be changed later from the UART console (GPIO43/44).
+            wyzesense2mqtt-rs bridge endpoint. Can be changed later from the UART console. Do not put a user name, password or token in the URI: use the token option below.
 
     config WYZE_BRIDGE_TOKEN
         string "Bridge auth token"
         default ""
         help
-            Must match BRIDGE_AUTH_TOKEN on the gateway. Sent as the ?token= query parameter.
+            Must match bridge.auth_token in the gateway settings. Sent as the ?token= query parameter.
 
     config WYZE_REQUIRE_TOKEN
         bool "Refuse OTA and reboot requests while no bridge token is set"

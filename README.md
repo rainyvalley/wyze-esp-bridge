@@ -1,143 +1,128 @@
 # wyze-esp-bridge
 
-ESP32 USB host relay for [wyzesense2mqtt-rs](https://github.com/HclX/wyzesense2mqtt-rs): plug the
-Wyze Sense Bridge dongle (USB `1a86:e024`) into the ESP32's USB host port, and the sensors end up on
-your MQTT broker via the gateway — with the ESP32 on Ethernet *or Wi-Fi*, anywhere in the house, not
-tethered to a USB port on the gateway machine. This project is a hardware counterpart to the
-gateway's desktop `dongle_bridge` binary: it implements the same `/ws/bridge` wire protocol, but
-the "cable" is a WebSocket.
+Firmware for an ESP32 board that carries your Wyze Sense Bridge dongle over the network.
 
-A [Waveshare ESP32-P4-WIFI6-POE-ETH](https://www.waveshare.com/esp32-p4-wifi6-poe-eth.htm) board is the
-recommended host: its USB-A port speaks the USB 2.0 host role the dongle needs, its internal
-Ethernet keeps the link wired, and its ESP32-C6 co-processor provides Wi-Fi as an automatic
-fallback when the cable is out. Waveshare also makes the S3-ETH PoE board
-([wiki](https://www.waveshare.com/esp32-s3-eth.htm)); a plain ESP32-S3-DevKitC-1 is the cheapest
-option and runs the same code Wi-Fi-only. See the matrix below.
+Plug the dongle (USB `1a86:e024`) into the board. The board sends the sensor data to your
+[wyzesense2mqtt-rs](https://github.com/HclX/wyzesense2mqtt-rs) gateway over Ethernet or Wi-Fi.
+The gateway then publishes it to your MQTT broker. The dongle no longer has to sit next to the gateway.
 
-All three boards run the **same firmware** — pick by connectivity:
+**You need a gateway.** Install and run [`HclX/wyzesense2mqtt-rs`](https://github.com/HclX/wyzesense2mqtt-rs)
+on any machine that stays on. This firmware connects to its `/ws/bridge` address and signs in with the
+gateway's `bridge.auth_token`.
 
-| Build | Board | Ethernet | Wi-Fi | Dongle port | Console | Rough price |
+## Boards
+
+All boards run the same firmware. Pick one by how you want to connect.
+
+| Build | Board | Ethernet | Wi-Fi | Dongle goes in | Setup cable | Price |
 |---|---|---|---|---|---|---|
-| `p4` / `p4-rev1` | Waveshare **ESP32-P4-WIFI6-POE-ETH** — [Amazon](https://www.amazon.com/dp/B0GFJQSN9B) | yes (internal EMAC + IP101) | Wi-Fi 6 fallback (ESP32-C6 over SDIO) | **USB-A** | USB-C (CH343) | ~$25 |
-| `s3-eth` | Waveshare ESP32-S3-ETH PoE — [Amazon](https://a.co/d/0dSdbcFS) | yes (W5500 over SPI) | fallback (S3's own radio) | USB-C + OTG adapter | Header GPIO43/44 | ~$30 |
-| `s3-eth` (bare) | ESP32-S3-DevKitC-1 N16R8 — [Amazon](https://a.co/d/04rXdiuX) | — | **Wi-Fi only** | "USB" port + OTG adapter | "UART" USB-C port | ~$10 |
+| `p4` or `p4-rev1` | Waveshare [ESP32-P4-WIFI6-POE-ETH](https://www.waveshare.com/esp32-p4-wifi6-poe-eth.htm) ([Amazon](https://www.amazon.com/dp/B0GFJQSN9B)) | yes | backup | **USB-A** port | USB-C | about $25 |
+| `s3-eth` | Waveshare [ESP32-S3-ETH](https://www.waveshare.com/esp32-s3-eth.htm) ([Amazon](https://a.co/d/0dSdbcFS)) | yes | backup | USB-C port, with an OTG adapter | header pins GPIO43 and GPIO44 | about $30 |
+| `s3-eth` | ESP32-S3-DevKitC-1 N16R8 ([Amazon](https://a.co/d/04rXdiuX)) | no | **only network** | "USB" port, with an OTG adapter | "UART" USB-C port | about $10 |
 
-The Wi-Fi-only DevKitC row is the cheapest working setup: the `s3-eth` image notices there is no
-W5500 (`no ethernet (...), wifi only` in the log) and Wi-Fi *becomes* the primary network. A Wi-Fi
-SSID is mandatory there (console prompt or baked `CONFIG_WYZE_WIFI_SSID`). Make sure the dongle gets
-5 V on the native "USB" port — the DevKitC-1 doesn't necessarily feed VBUS out of that port when
-powered from the "UART" port; a powered OTG hub/Y-cable is the safe option.
+The P4 board is the one to buy if you are unsure.
 
-**You need a Gateway:** download and run [`HclX/wyzesense2mqtt-rs`](https://github.com/HclX/wyzesense2mqtt-rs)
-on any always-on machine (docs and setup in that repo). This firmware connects to its `/ws/bridge`
-WebSocket endpoint and authenticates with the gateway's `bridge.auth_token`.
+On the DevKitC-1 the firmware logs `no ethernet (...), wifi only` and uses Wi-Fi as its main network.
+You must set a Wi-Fi name there. The dongle needs 5 V from the "USB" port. That port may not supply
+power when the board is powered from the "UART" port, so use a powered OTG hub if the dongle does not light up.
 
-## Network behavior
+## How it connects
 
-- **Ethernet is primary.** Once it has an IP (not merely a link — a cable into a dead port or a
-  switch without DHCP doesn't count), Wi-Fi shuts off (`wifi stopped (ethernet is primary)`).
-- **Wi-Fi is a fallback** (when an SSID is configured): at boot it starts if Ethernet has no IP
-  within 8 s, starts ~1 s after the link drops (or after Ethernet loses its DHCP address), retries
-  every 5 s, and stops when Ethernet has an IP again. Never both in use at once. Boards without Ethernet hardware go straight to Wi-Fi.
-- The WebSocket stays open only while the dongle is plugged in **and** a network is up. Switching
-  between Ethernet and Wi-Fi, or replugging the dongle, recycles the gateway session. A wedged
-  WebSocket client is detected and rebuilt (~2 min watchdog).
-- `/status` reports `network` (`ethernet`/`wifi`/`none`) and the IP of the interface in use.
+- **Ethernet comes first.** It counts once the board has an IP address. A cable in a dead port does not count.
+- **Wi-Fi is the backup**, and only if you set a Wi-Fi name. At boot it starts if Ethernet has no address after 8 s.
+  It starts about 1 s after Ethernet drops. It retries every 5 s. It stops when Ethernet has an address again.
+- The board never uses both at once. Boards with no Ethernet go straight to Wi-Fi.
+- The link to the gateway is open only while the dongle is plugged in and a network is up.
+  Unplugging the dongle or switching between Ethernet and Wi-Fi ends the gateway session, and a new one starts.
+- If the board has had no gateway connection for about 2 minutes, it restarts its gateway client. This also
+  happens when the gateway is simply off.
+- Between attempts the board waits 5 to 10 s, a random time each start, so many boards do not retry in step.
+- `/status` shows which network is in use (`ethernet`, `wifi` or `none`) and its IP address.
 
 ## Quick start (ESP32-P4)
 
-1. **Buy the board** ([Amazon](https://www.amazon.com/dp/B0GFJQSN9B)) and assemble; PoE/PoE-splitter
-   for power is optional (USB-C 5V also works).
-2. **Download a release binary** from [GitHub Releases](https://github.com/rainyvalley/wyze-esp-bridge/releases)
-   (or build from source, below). Pick the image by your chip revision — see [Firmware variants](#firmware-variants).
-3. **Flash** over USB-C (dongle can stay plugged in; esptool auto-resets into download mode):
+1. **Get the board.** Power it with USB-C (5 V) or PoE.
+2. **Download a release file** from [GitHub Releases](https://github.com/rainyvalley/wyze-esp-bridge/releases),
+   or [build it yourself](#build-from-source). Choose the file for your chip, see [Firmware variants](#firmware-variants).
+3. **Flash it** over USB-C. The dongle can stay plugged in.
    ```bash
-   pipx run esptool --chip esp32p4 -p /dev/ttyACM0 write_flash 0x0 wyze-esp-bridge-p4-rev1-merged.bin
+   pipx run esptool --chip esp32p4 -p <serial-port> write_flash 0x0 wyze-esp-bridge-p4-rev1-merged.bin
    ```
-   (esptool v5 renamed the subcommand to `write-flash`.)
-4. **Configure on first boot**: open the console (`pipx run --spec pyserial pyserial-miniterm /dev/ttyACM0 115200`),
-   and press **Enter** within 3 s of the banner to enter:
-   - your gateway URI (e.g. `ws://192.168.1.50:8080/ws/bridge`)
-   - your bridge token, matching the gateway's `bridge.auth_token` (masked input; Enter keeps the currently stored value)
-   - Wi-Fi SSID and password (leave SSID blank for pure-Ethernet operation)
-
-   At every prompt, Enter keeps the value in brackets and `-` clears it (e.g. `-` at the SSID
-   prompt turns Wi-Fi off). A prompt left unanswered for 60 s cancels setup without saving, and the
-   board boots normally.
-
-   Values are stored in NVS and survive reboots and OTA updates. If you bake your values in at build
-   time instead (`sdkconfig.local.defaults`, see [Build from source](#build-from-source)), just let
-   the 3 s prompt time out.
-5. The board boots into `waiting for Wyze dongle`; plug the dongle into the USB-A port (sold with
-   your Wyze system, the little USB-A stick), and you'll see:
+   With esptool 5 the command is `write-flash`.
+4. **Set it up.** Open the serial console and press **Enter** within 3 s of the banner.
+   ```bash
+   pipx run --spec pyserial pyserial-miniterm <serial-port> 115200
    ```
-   wyze-esp-bridge 2.4.1 (esp32p4-eth)
-   ...
-   network up (wifi), IP 192.168.x.x     <- if no ethernet cable
+   You are asked for:
+   - **Gateway URI**, for example `ws://<gateway-ip>:8080/ws/bridge`. Do not put a password or token in it.
+   - **Bridge token**, the same as the gateway's `bridge.auth_token`. Typing is hidden.
+   - **Wi-Fi name and password.** Leave the name empty if you only use Ethernet.
+
+   At each prompt, Enter keeps the value in brackets and `-` clears it. If you do not answer for
+   60 s, setup is cancelled and nothing is saved. The board then starts normally.
+
+   The values are saved on the board. They stay after a restart and after a firmware update.
+   If you built your own image with the values inside (see [Build from source](#build-from-source)),
+   skip setup and let the 3 s run out.
+5. **Plug in the dongle.** The log shows `waiting for Wyze dongle`, then:
+   ```
+   network up (wifi), IP ...          <- only without an Ethernet cable
    Wyze dongle up, connecting to gateway
    gateway connected
    ```
-   (With no ethernet, Wi-Fi comes up ~5–10 s in; the dongle enumerates within ~16 s — a single
-   automatic replug emulation may happen at ~10 s first. Be patient once; only replug by hand if
-   it hasn't come up after ~30 s.)
-6. **Pair sensors** on the gateway's own dashboard (`http://<gateway>:8080`), same as you would with
-   a USB-attached dongle. The bridge presents itself to the gateway under `device=esp32p4-eth`.
+   Give it up to 30 s. The dongle can take about 16 s to be found, and the board may unplug and replug
+   it once on its own. Replug it by hand only if nothing happens after 30 s.
+6. **Pair sensors** on the gateway's own web page (port 8080), as you would with a dongle on the gateway itself.
+   The gateway sees this board as `device=esp32p4-eth` (or `esp32s3-eth`).
 
-### Wi-Fi fallback (optional)
+### Wi-Fi backup
 
-The setup prompt asks for a Wi-Fi SSID and password at the same time as the gateway settings:
+- **Wi-Fi name and password saved:** Ethernet is used when the cable is in, Wi-Fi when it is out.
+- **Wi-Fi name empty (or cleared with `-`):** Wi-Fi stays off.
+- Wi-Fi on the P4 board is provided by a second chip (the ESP32-C6) on the same board. It works on 2.4 GHz only.
+- Wi-Fi accepts WPA, WPA2 and WPA3-mixed networks. If a password is set, an open network with the same name is refused.
+- A failed connection is retried every 5 s.
 
-- **SSID + password stored → the board uses Ethernet when the cable is in, and Wi-Fi when it's out.**
-- **Leave SSID blank (or enter `-` to clear a stored one) → Wi-Fi stays off entirely** (pure-Ethernet
-  board, like before v2.2).
-- The Wi-Fi runs on the board's ESP32-C6 co-processor over SDIO (ESP-Hosted). A factory C6 firmware
-  prints `esp-hosted fw versions: host=3.x coprocessor=0.0.0`+`major version mismatch` at boot —
-  harmless (association + data path work); updating the C6 firmware via esp-usb/esp-hosted OTA is
-  on the roadmap. Currently 2.4 GHz only (C6 limit).
-- Wi-Fi connect failures retry every 5 s; association works with WPA1/WPA2/WPA3-mixed APs, and with
-  open APs only when no password is set (with a password set, an open AP using the same SSID is
-  refused).
-
-A useful debugging window between resets: board `/status` over Wi-Fi can be flaky in dual-homed
-LANs (some APs isolate clients); the **gateway's dashboard is the source of truth** for whether a
-bridge session is live (`/api/dongles` shows the session + its sensors).
+If you cannot open `/status` over Wi-Fi, your router may be blocking device-to-device traffic.
+Check the gateway's web page instead (`/api/dongles` lists the bridge and its sensors).
 
 ## Firmware variants
 
-ESP-IDF treats ESP32-P4 chip revisions **v3.x** and **v0.x/v1.x** as separate hardware. Check yours:
+The ESP32-P4 chip comes in two hardware revisions, and they need different files. Check yours:
 
 ```bash
-pipx run esptool --chip esp32p4 -p /dev/ttyACM0 chip_id
+pipx run esptool --chip esp32p4 -p <serial-port> chip_id
 ```
 
-- Chip revision `v3.x` → use `wyze-esp-bridge-p4-*.bin`
-- Chip revision `v0.x`/`v1.x` (e.g. `v1.3`) → use `wyze-esp-bridge-p4-rev1-*.bin`
+| Chip revision | Use |
+|---|---|
+| v3.x | `wyze-esp-bridge-p4-*.bin` |
+| v0.x or v1.x (for example v1.3) | `wyze-esp-bridge-p4-rev1-*.bin` |
 
-Current `PARTITION` is printed in `/status`; the board has 16 MB flash and two 3 MB OTA slots. OTA
-rollback is armed: a new image is on trial until its WebSocket connection to the gateway comes up,
-and any reset before that (crash, watchdog, `/reboot`, saving settings on the console) rolls back to
-the previous slot. If the gateway has not connected 5 minutes after the network came up (gateway
-down or misconfigured, dongle unplugged), the image is kept anyway, so a gateway problem never
-causes a rollback. An image that never gets an IP is never kept. While an image is on trial,
-`POST /ota` answers `503` (ESP-IDF cannot start another update before the running one is confirmed).
+The ESP32-S3 board uses `wyze-esp-bridge-s3-eth-*.bin`.
 
-### OTA updates (once the bridge is online)
+The board has 16 MB of flash and two 3 MB firmware slots. `/status` shows which one is running (`partition`).
 
-Updates go over the network to `POST /ota`; no USB cable needed after the first flash.
+**A new firmware is on trial first.** It is kept once it connects to the gateway. Any restart before
+that returns the board to the old firmware. This includes a crash, `/reboot` and saving settings on the console.
+If the gateway has not connected 5 minutes after the network came up, the new firmware is kept anyway.
+A firmware that never gets an IP address is never kept. While one is on trial, `POST /ota` answers `503`.
 
-**Your settings must be in NVS first.** Release images carry placeholder settings; the gateway URI,
-token and Wi-Fi settings you entered on the console live in NVS and survive updates. If you instead
-built your own image with `sdkconfig.local.defaults`, boot a 2.4.1 or later build of your own once
-before installing a release image: it copies its built-in settings into NVS (the log says `saved the
-built-in gateway/Wi-Fi settings to NVS`). Otherwise the release image boots with the placeholder
-gateway, never connects, and is rolled back only if you reboot it within 5 minutes.
+### Update over the network
 
-1. **Pick the right image.** Use the same variant you flashed first (see
-   [Firmware variants](#firmware-variants)): `p4` for chip v3.x, `p4-rev1` for v0.x/v1.x, `s3-eth`
-   for the S3 board. A wrong-variant image is rejected by the bridge (`500`) and nothing changes.
+Updates use `POST /ota`. You do not need the USB cable after the first flash.
 
-2. **Download it and check it.** From the [latest release](https://github.com/rainyvalley/wyze-esp-bridge/releases/latest),
-   grab the `-ota.bin` for your variant and `SHA256SUMS`:
+**Your settings must be saved on the board first.** Release files contain placeholder settings. The gateway
+address, token and Wi-Fi details you typed at setup are saved on the board and kept. If you built your own
+image with settings inside, run that image once before you install a release file. On its first start it
+saves those settings to the board (the log says `saved the built-in gateway/Wi-Fi settings to NVS`).
+Without this, the release file starts with the placeholder gateway and never connects.
+
+1. **Pick the right file.** Use the same variant you flashed first: `p4`, `p4-rev1` or `s3-eth`.
+   The wrong variant is refused with `500` and nothing changes.
+
+2. **Download and check it.** Get the `-ota.bin` for your variant and `SHA256SUMS` from the
+   [latest release](https://github.com/rainyvalley/wyze-esp-bridge/releases/latest):
 
    ```bash
    V=p4-rev1   # or p4 / s3-eth
@@ -145,61 +130,78 @@ gateway, never connects, and is rolled back only if you reboot it within 5 minut
    sha256sum --check --ignore-missing SHA256SUMS
    ```
 
-   (Without `gh`: download the same two files from the release page in a browser.)
+   Without `gh`, download both files from the release page in a browser. `SHA256SUMS` catches a damaged
+   download. It does not prove who made the file.
 
-3. **Note what's running now,** so you can tell the update took:
+3. **Note what runs now:**
 
    ```bash
-   curl -s http://<board-ip>/status   # "version", "built", "partition"
+   curl -s http://<board-ip>/status   # look at "version", "built", "partition"
    ```
 
-4. **Upload.** Use the bridge token you set on the console (leave the header out if none is set):
+4. **Upload.** Use the token you set at setup. Leave the header out if no token is set.
 
    ```bash
    curl --fail-with-body -H "Authorization: Bearer <token>" \
         --data-binary @wyze-esp-bridge-$V-ota.bin http://<board-ip>/ota
    ```
 
-   Takes 10–30 s and answers `ok, rebooting`. The bridge restarts into the other OTA slot.
+   It takes 10 to 30 s and answers `ok, rebooting`.
 
-5. **Check it came back.** After ~20 s (P4: the dongle takes ~16 s to enumerate):
+5. **Check it came back.** Wait about 20 s, then:
 
    ```bash
    curl -s http://<board-ip>/status   # new "version", the other "partition", "gateway_connected": true
    ```
 
-   The new image is **on trial** until it connects to the gateway (or 5 minutes pass with the
-   network up). `GET /log` shows `new firmware marked valid` once it is kept. Don't reboot or
-   power-cycle it before then: a reset during the trial rolls back to the previous version.
+   `GET /log` shows `new firmware marked valid` once the new firmware is kept. Do not restart or unplug
+   the board before that, or it goes back to the old firmware.
 
-| Response | Meaning |
-|---|---|
-| `ok, rebooting` | Image written and verified; the bridge restarts into it |
-| `401 bad or missing token` | Wrong or missing `Authorization: Bearer` token |
-| `503 … still on trial` | The current image isn't confirmed yet; wait for the gateway to connect (≤5 min) and retry |
-| `400 missing or oversized image` | Empty upload or wrong file (use `-ota.bin`, not `-merged.bin`) |
-| `500 <error>` | Image rejected, e.g. wrong chip variant or corrupt download; the running firmware is untouched |
+| You see | It means | Do this |
+|---|---|---|
+| `ok, rebooting` | The file was written and checked. | Wait for the restart. |
+| `401 bad or missing token` | The token is wrong or missing. | Send `Authorization: Bearer <token>`. Each wrong try is answered after a 0.5 s wait. |
+| `503 ... still on trial` | The running firmware is not confirmed yet. | Wait until the gateway connects (5 min at most), then try again. |
+| `400 missing or oversized image` | The upload is empty or the wrong file. | Use the `-ota.bin` file, not `-merged.bin`. |
+| `500 <error>` | The file was refused, for example wrong chip or damaged download. | Check the variant and the checksum. The running firmware is not changed. |
 
-If the bridge comes back on the old version, the new image was rolled back: check `GET /log`.
+If the board comes back on the old version, the new firmware was rolled back. Read `GET /log`.
 
-HTTP endpoints: `GET /status` (JSON), `GET /log` (this boot's ring buffer), `POST /ota` (token),
-`POST /reboot` (token). Token can also be `?token=` query-param (percent-encoded).
+### Web addresses on the board
 
-`/status` and `/log` need no token. Values of `token=` are masked in the log. **While no token is
-set, `/ota` and `/reboot` are open to anyone on the network**: set a token on the console, or build
-with `CONFIG_WYZE_REQUIRE_TOKEN=y` to refuse them until one is set.
+| Address | What it does | Token needed |
+|---|---|---|
+| `GET /status` | Shows the state as JSON. | no |
+| `GET /log` | Shows the log since the last restart (the last 48 KB). `token=` values are hidden. | no |
+| `POST /ota` | Installs a firmware file. | yes |
+| `POST /reboot` | Restarts the board. | yes |
+
+The token goes in the `Authorization: Bearer` header. `?token=` in the address also works, with the
+token written in URL form (for example `%2B` for `+`). A header is safer, because addresses end up in logs.
+
+## Security
+
+- The board talks to the gateway with `ws://`, and its web address is plain `http://`. Nothing is encrypted.
+  The token is sent in the clear. Use this on a network you trust.
+- **While no token is set, anyone on the network can use `/ota` and `/reboot`.** Set a token at setup.
+  Or build with `CONFIG_WYZE_REQUIRE_TOKEN=y`, which refuses both until a token is set.
+- `/status` and `/log` need no token. They show the board's version, IP address, gateway address and log.
+- Put the token in the token field, not in the gateway URI. Only a `token=` in the URI is hidden in `/status` and `/log`.
+- The token and Wi-Fi password are saved on the board without encryption. Anyone who holds the board and its
+  serial port has full control of it.
+- Firmware files are not signed. The board accepts any valid image sent with the right token.
 
 ## Build from source
 
-All variants at once (Docker, no IDF install needed):
+Build every variant with Docker (no ESP-IDF install needed):
 
 ```bash
 docker run --rm -v "$PWD":/project -w /project espressif/idf:release-v5.5 ./build.sh
 ```
 
-Output lands in `out/`: `<name>-merged.bin` (flash at 0x0) and `<name>-ota.bin` (POST to `/ota`).
+The files appear in `out/`: `<name>-merged.bin` (flash at 0x0) and `<name>-ota.bin` (send to `/ota`).
 
-Single variant (see `build.sh` for the pattern):
+For one variant (see `build.sh`):
 
 ```bash
 docker run --rm -v "$PWD":/project -w /project espressif/idf:release-v5.5 \
@@ -208,57 +210,41 @@ docker run --rm -v "$PWD":/project -w /project espressif/idf:release-v5.5 \
   set-target esp32p4 reconfigure build
 ```
 
-Every release binary on this repo is built by CI with `./build.sh` (all variants) in the same
-container image, pinned by digest in `.github/workflows/release.yml`; releases include `SHA256SUMS`.
+Release files are built by CI with `./build.sh` in a pinned container image. Each release includes `SHA256SUMS`.
 
-Site-specific values (gateway URI, token, Wi-Fi credentials) can be baked in through a git-ignored
-`sdkconfig.local.defaults`, which `build.sh` appends when present. Images built that way contain
-those secrets in plain text: never share or upload them.
+To build in your own settings (gateway address, token, Wi-Fi), put them in a file named
+`sdkconfig.local.defaults`. Git ignores it, and `build.sh` adds it when it exists. Such an image
+contains those secrets as plain text, so never share it.
 
-Component versions are locked per target in `dependencies.lock.esp32p4` and
-`dependencies.lock.esp32s3`.
+The versions of the libraries used are fixed in `dependencies.lock.esp32p4` and `dependencies.lock.esp32s3`.
 
-## Protocol notes
-
-- Dongle → gateway: HID input report `[len][data…]`, forward `data[0..len]` as one binary WS frame.
-- Gateway → dongle: one binary WS frame = one protocol packet, sent as HID
-  `SET_REPORT` (Output, report ID 0) — the dongle has no interrupt OUT endpoint. A packet larger
-  than the dongle's output report (read from its HID report descriptor at plug-in and logged as
-  `dongle output report: N bytes`; 64 if the descriptor can't be read) is dropped with a log line.
-- Auth: `?token=<bridge token>` query parameter plus `device=<BOARD_NAME>`, per the gateway's
-  [`multi_dongle_design.md`](https://github.com/HclX/wyzesense2mqtt-rs/blob/main/docs/multi_dongle_design.md).
-- The WebSocket stays open only while the dongle is plugged in and the network is up, so the gateway
-  sees a proper disconnect when the dongle is removed.
+Maintainer notes, including the data flow and known pitfalls, are in [AGENTS.md](AGENTS.md).
 
 ## Troubleshooting
 
-- **`dongle:false` in `/status` but the gateway shows the bridge connected** — trust the gateway
-  (`/api/dongles`); the bridge's own flags can be stale.
-- **`HUB: Root port reset failed` at boot, then dongle enumerates ~16 s in** — normal: the boot
-  settle bounce plus a one-shot replug emulation (8 s after power-on) recovers it. If the dongle
-  never comes up, unplug/replug it once.
-- **`StaDisconnected reason=211`** — the Wi-Fi scan threshold filtered your AP (older builds);
-  v2.2.2+ uses the weakest PSK threshold (WPA) when a password is set, open otherwise. Reason 202 =
-  wrong password.
-- **`esp-hosted fw versions ... major version mismatch`** — the factory C6 co-processor firmware;
-  benign, Wi-Fi still works.
-- **Boot-loop on older P4 revisions with the dongle pre-powered** — fixed since v2.0.8
-  (`root_port_unpowered` at install + power bounce before hub events). Update past that version.
-- **`GET /log` shows only this boot** — it's a 48 KB RAM ring; there is no persistent log.
+| You see | It means | Do this |
+|---|---|---|
+| `/status` says `dongle` is false, but the gateway shows the bridge | The two views disagree. | Trust the gateway's `/api/dongles`. |
+| `HUB: Root port reset failed` at boot, then the dongle appears after about 16 s | Normal on the P4 board. The board replugs the dongle itself once. | Wait. Replug by hand only if it never comes up. |
+| `wifi disconnected (reason 202)` | Wrong Wi-Fi password. | Run setup again. |
+| `wifi disconnected (reason 201)` or `211` | The Wi-Fi network was not found. | Check the name and that it is 2.4 GHz. |
+| `esp-hosted fw versions ... major version mismatch` | The Wi-Fi chip on the P4 board has older factory firmware. | Nothing. Wi-Fi still works. |
+| `no gateway connection for 2 min, restarting the client` | The gateway has been unreachable for 2 minutes. | Check that the gateway is running and the URI and token are right. |
+| `GET /log` only shows lines since the last restart | The log is kept in memory only. | Nothing. It is not saved. |
 
 ## Acknowledgments
 
-- [`HclX/wyzesense2mqtt-rs`](https://github.com/HclX/wyzesense2mqtt-rs) — the gateway and the
-  `/ws/bridge` protocol this firmware implements; this project started as its companion device firmware.
-- [`raetha/wyzesense2mqtt`](https://github.com/raetha/wyzesense2mqtt) — original Python gateway,
-  source of much of the underlying protocol knowledge.
-- `HclX/WyzeSensePy` / community reverse-engineering of the Wyze Sense dongle protocol.
+- [`HclX/wyzesense2mqtt-rs`](https://github.com/HclX/wyzesense2mqtt-rs) is the gateway and defines the
+  `/ws/bridge` protocol this firmware uses.
+- [`raetha/wyzesense2mqtt`](https://github.com/raetha/wyzesense2mqtt) is the original Python gateway
+  and the source of much of what is known about the protocol.
+- `HclX/WyzeSensePy` and the community work on the Wyze Sense dongle protocol.
 
 ## Enclosure
 
-`case/wyze_esp_bridge_p4_case.scad` — parametric OpenSCAD case for the P4 board (60 × 74.3 × 27.1 mm,
-snap-fit or M2.5 screws). Previews in `case/*.png`. See comments in the `.scad` file for print settings
-and `MEASURE`-marked values. `case/wyze_esp_bridge_case.scad` is for an earlier (obsolete) S3 build.
+`case/wyze_esp_bridge_p4_case.scad` is a 3D-printable OpenSCAD case for the P4 board
+(60 x 74.3 x 27.1 mm, snap-fit or M2.5 screws). Previews are in `case/*.png`. The `.scad` file explains
+the print settings and the values marked `MEASURE`. `case/wyze_esp_bridge_case.scad` is for an old S3 build and is obsolete.
 
 ## A note on AI assistance
 
