@@ -257,4 +257,4 @@ Parts of this project — code, configuration, and documentation — were writte
 
 ## License
 
-[MIT](LICENSE)
+[BSD 2-Clause](LICENSE)
