@@ -520,6 +520,81 @@ void test_cut_line_with_token_is_redacted(void)
     TEST_ASSERT_NULL(strstr(line, "abc"));
 }
 
+// ------------------------------------------------------------------ auth_limiter, rate_gate
+
+void test_limiter_allows_until_max_fails(void)
+{
+    auth_limiter_t l = {0};
+    for (int i = 0; i < 4; i++) {
+        auth_limiter_fail(&l, 1000, 5);
+        TEST_ASSERT_FALSE(auth_limiter_blocked(&l, 1000, NULL));
+    }
+    auth_limiter_fail(&l, 1000, 5);
+    uint32_t retry = 0;
+    TEST_ASSERT_TRUE(auth_limiter_blocked(&l, 1000, &retry));
+    TEST_ASSERT_EQUAL_UINT32(30, retry);
+}
+
+void test_limiter_unblocks_after_window(void)
+{
+    auth_limiter_t l = {0};
+    for (int i = 0; i < 5; i++) {
+        auth_limiter_fail(&l, 0, 5);
+    }
+    TEST_ASSERT_TRUE(auth_limiter_blocked(&l, 29999, NULL));
+    TEST_ASSERT_FALSE(auth_limiter_blocked(&l, 30000, NULL));
+}
+
+void test_limiter_window_doubles_and_caps(void)
+{
+    auth_limiter_t l = {0};
+    uint32_t retry = 0;
+    for (int i = 0; i < 5; i++) {
+        auth_limiter_fail(&l, 0, 5);
+    }
+    auth_limiter_fail(&l, 0, 5);
+    TEST_ASSERT_TRUE(auth_limiter_blocked(&l, 0, &retry));
+    TEST_ASSERT_EQUAL_UINT32(60, retry);
+    for (int i = 0; i < 200; i++) {
+        auth_limiter_fail(&l, 0, 5);
+    }
+    TEST_ASSERT_TRUE(auth_limiter_blocked(&l, 0, &retry));
+    TEST_ASSERT_EQUAL_UINT32(900, retry);
+}
+
+void test_limiter_success_resets(void)
+{
+    auth_limiter_t l = {0};
+    for (int i = 0; i < 5; i++) {
+        auth_limiter_fail(&l, 0, 5);
+    }
+    auth_limiter_ok(&l);
+    TEST_ASSERT_FALSE(auth_limiter_blocked(&l, 0, NULL));
+    auth_limiter_fail(&l, 0, 5);  // counting starts again from 1
+    TEST_ASSERT_FALSE(auth_limiter_blocked(&l, 0, NULL));
+}
+
+void test_limiter_zero_max_acts_as_one_and_counter_saturates(void)
+{
+    auth_limiter_t l = {0};
+    auth_limiter_fail(&l, 0, 0);
+    TEST_ASSERT_TRUE(auth_limiter_blocked(&l, 0, NULL));
+    l.fails = UINT32_MAX;
+    auth_limiter_fail(&l, 0, 5);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, l.fails);
+    TEST_ASSERT_TRUE(auth_limiter_blocked(&l, 0, NULL));
+}
+
+void test_rate_gate_spaces_requests(void)
+{
+    int64_t last = INT64_MIN / 2;
+    TEST_ASSERT_TRUE(rate_gate(&last, 0, 250));
+    TEST_ASSERT_FALSE(rate_gate(&last, 100, 250));
+    TEST_ASSERT_TRUE(rate_gate(&last, 250, 250));
+    TEST_ASSERT_FALSE(rate_gate(&last, 499, 250));
+    TEST_ASSERT_TRUE(rate_gate(&last, 500, 250));
+}
+
 // ------------------------------------------------------------------ fuzz-ish combined
 
 void test_redact_after_escape_still_masks_uri_token(void)
@@ -599,6 +674,12 @@ int main(void)
     RUN_TEST(test_mark_truncated_ends_line_visibly);
     RUN_TEST(test_mark_truncated_tiny_buffer_untouched);
     RUN_TEST(test_cut_line_with_token_is_redacted);
+    RUN_TEST(test_limiter_allows_until_max_fails);
+    RUN_TEST(test_limiter_unblocks_after_window);
+    RUN_TEST(test_limiter_window_doubles_and_caps);
+    RUN_TEST(test_limiter_success_resets);
+    RUN_TEST(test_limiter_zero_max_acts_as_one_and_counter_saturates);
+    RUN_TEST(test_rate_gate_spaces_requests);
     RUN_TEST(test_redact_after_escape_still_masks_uri_token);
     return UNITY_END();
 }

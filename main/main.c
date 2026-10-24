@@ -1059,8 +1059,6 @@ static bool ota_confirm_poll(net_kind_t net, int64_t *net_since_us)
 
 // ---------------------------------------------------------------- HTTP: status, log, OTA
 
-#define UNAUTHORIZED_DELAY_MS 500
-
 // Accepts the bridge token as "Authorization: Bearer <token>" or ?token=<token>.
 static bool http_authorized(httpd_req_t *req)
 {
@@ -1089,8 +1087,7 @@ static bool http_authorized(httpd_req_t *req)
 }
 
 // Rejects with 401. The request body is read and dropped first (up to 4 KB; for a larger one the
-// connection is closed instead) so it is not parsed as the next request. The short delay slows
-// down token guessing, since the HTTP server handles one request at a time.
+// connection is closed instead) so it is not parsed as the next request.
 static esp_err_t http_unauthorized(httpd_req_t *req)
 {
     char scratch[128];
@@ -1106,13 +1103,59 @@ static esp_err_t http_unauthorized(httpd_req_t *req)
             left -= n;
         }
     }
-    vTaskDelay(pdMS_TO_TICKS(UNAUTHORIZED_DELAY_MS));
     httpd_resp_set_status(req, "401 Unauthorized");
     return httpd_resp_sendstr(req, "bad or missing token\n");
 }
 
+static auth_limiter_t s_auth_limiter;  // only touched by the HTTP server task
+static int64_t s_open_route_last_ms = INT64_MIN / 2;
+
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+// Answers 429 and returns false when the route is hit more than about 4 times a second.
+static bool http_rate_ok(httpd_req_t *req)
+{
+    if (rate_gate(&s_open_route_last_ms, now_ms(), 250)) {
+        return true;
+    }
+    httpd_resp_set_status(req, "429 Too Many Requests");
+    httpd_resp_set_hdr(req, "Retry-After", "1");
+    httpd_resp_sendstr(req, "too many requests\n");
+    return false;
+}
+
+// For token-checked routes. Returns true if the request may go on; otherwise the reply (429 while
+// locked out, 401 for a wrong token) has been sent. Wrong tokens are counted; see auth_limiter_t.
+static bool http_check_auth(httpd_req_t *req)
+{
+    uint32_t retry_s = 0;
+    if (auth_limiter_blocked(&s_auth_limiter, now_ms(), &retry_s)) {
+        char num[12];
+        snprintf(num, sizeof(num), "%u", (unsigned)retry_s);
+        httpd_resp_set_hdr(req, "Retry-After", num);
+        httpd_resp_set_hdr(req, "Connection", "close");  // body is not read
+        httpd_resp_set_status(req, "429 Too Many Requests");
+        ESP_LOGW(TAG, "too many wrong tokens; HTTP logins locked for %u s", (unsigned)retry_s);
+        httpd_resp_sendstr(req, "too many wrong tokens, try again later\n");
+        return false;
+    }
+    if (http_authorized(req)) {
+        auth_limiter_ok(&s_auth_limiter);
+        return true;
+    }
+    auth_limiter_fail(&s_auth_limiter, now_ms(), CONFIG_WYZE_AUTH_MAX_FAILS);
+    http_unauthorized(req);
+    return false;
+}
+
 static esp_err_t status_get(httpd_req_t *req)
 {
+    if (!http_rate_ok(req)) {
+        return ESP_OK;
+    }
     const esp_app_desc_t *app = esp_app_get_description();
     const net_kind_t net = net_active();
     esp_netif_ip_info_t ip = {0};
@@ -1148,6 +1191,9 @@ static esp_err_t status_get(httpd_req_t *req)
 
 static esp_err_t log_get(httpd_req_t *req)
 {
+    if (!http_rate_ok(req)) {
+        return ESP_OK;
+    }
     // Streamed in small chunks, each copied under the (interrupt-masking) spinlock and sent
     // without it: no 48 KB allocation and no long critical section. Text that is overwritten
     // while the response is being sent is skipped, never sent garbled.
@@ -1191,8 +1237,8 @@ static void restart_task(void *arg)
 
 static esp_err_t ota_post(httpd_req_t *req)
 {
-    if (!http_authorized(req)) {
-        return http_unauthorized(req);
+    if (!http_check_auth(req)) {
+        return ESP_OK;
     }
     if (ota_pending_verify()) {
         // esp_ota_begin() refuses this state (ESP_ERR_OTA_ROLLBACK_INVALID_STATE); say why.
@@ -1258,8 +1304,8 @@ static esp_err_t ota_post(httpd_req_t *req)
 
 static esp_err_t reboot_post(httpd_req_t *req)
 {
-    if (!http_authorized(req)) {
-        return http_unauthorized(req);
+    if (!http_check_auth(req)) {
+        return ESP_OK;
     }
     httpd_resp_sendstr(req, "rebooting\n");
     xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);

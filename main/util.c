@@ -166,3 +166,51 @@ void log_mark_truncated(char *line, size_t size)
         memcpy(line + size - sizeof(mark), mark, sizeof(mark));
     }
 }
+
+bool auth_limiter_blocked(const auth_limiter_t *l, int64_t now_ms, uint32_t *retry_s)
+{
+    if (now_ms >= l->locked_until_ms) {
+        return false;
+    }
+    if (retry_s) {
+        *retry_s = (uint32_t)((l->locked_until_ms - now_ms + 999) / 1000);
+    }
+    return true;
+}
+
+void auth_limiter_fail(auth_limiter_t *l, int64_t now_ms, uint32_t max_fails)
+{
+    if (l->fails < UINT32_MAX) {
+        l->fails++;
+    }
+    if (max_fails == 0) {
+        max_fails = 1;
+    }
+    if (l->fails < max_fails) {
+        return;
+    }
+    uint32_t shift = l->fails - max_fails;  // 0 on the first lockout
+    int64_t window_ms = 30000;
+    while (shift-- > 0 && window_ms < 15 * 60 * 1000) {
+        window_ms *= 2;
+    }
+    if (window_ms > 15 * 60 * 1000) {
+        window_ms = 15 * 60 * 1000;
+    }
+    l->locked_until_ms = now_ms + window_ms;
+}
+
+void auth_limiter_ok(auth_limiter_t *l)
+{
+    l->fails = 0;
+    l->locked_until_ms = 0;
+}
+
+bool rate_gate(int64_t *last_ms, int64_t now_ms, int64_t min_gap_ms)
+{
+    if (now_ms - *last_ms < min_gap_ms && now_ms >= *last_ms) {
+        return false;
+    }
+    *last_ms = now_ms;
+    return true;
+}

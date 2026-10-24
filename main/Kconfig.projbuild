@@ -20,6 +20,15 @@ menu "Wyze ESP bridge"
             token is set (so a fresh flash can still be updated over the network). Enable this
             to refuse them instead; set a token on the console to unlock them.
 
+    config WYZE_AUTH_MAX_FAILS
+        int "Wrong tokens in a row before HTTP logins are locked out"
+        default 5
+        range 1 100
+        help
+            After this many wrong tokens in a row on /ota or /reboot, further attempts are refused
+            (429) for 30 s, doubling with each further wrong try up to 15 min. The lockout is shared
+            by all clients, and clears on a correct token or a restart.
+
     config WYZE_WIFI_SSID
         string "WiFi SSID (baked default)"
         default ""

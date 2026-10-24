@@ -160,7 +160,8 @@ Without this, the release file starts with the placeholder gateway and never con
 | You see | It means | Do this |
 |---|---|---|
 | `ok, rebooting` | The file was written and checked. | Wait for the restart. |
-| `401 bad or missing token` | The token is wrong or missing. | Send `Authorization: Bearer <token>`. Each wrong try is answered after a 0.5 s wait. |
+| `401 bad or missing token` | The token is wrong or missing. | Send `Authorization: Bearer <token>`. |
+| `429 too many wrong tokens` | Too many wrong tokens in a row. | Wait the number of seconds in the `Retry-After` header. |
 | `503 ... still on trial` | The running firmware is not confirmed yet. | Wait until the gateway connects (5 min at most), then try again. |
 | `400 missing or oversized image` | The upload is empty or the wrong file. | Use the `-ota.bin` file, not `-merged.bin`. |
 | `500 <error>` | The file was refused, for example wrong chip or damaged download. | Check the variant and the checksum. The running firmware is not changed. |
@@ -186,6 +187,10 @@ token written in URL form (for example `%2B` for `+`). A header is safer, becaus
 - **While no token is set, anyone on the network can use `/ota` and `/reboot`.** Set a token at setup.
   Or build with `CONFIG_WYZE_REQUIRE_TOKEN=y`, which refuses both until a token is set.
 - `/status` and `/log` need no token. They show the board's version, IP address, gateway address and log.
+- **Wrong tokens are limited.** After 5 wrong tokens in a row on `/ota` or `/reboot` (setting `CONFIG_WYZE_AUTH_MAX_FAILS`),
+  the board answers `429` for 30 s. Each further wrong try doubles the wait, up to 15 min. A correct token or a
+  restart clears it. The lock is shared by all clients, so someone guessing can also block you for a while.
+  `/status` and `/log` answer `429` if asked more than about 4 times a second.
 - Put the token in the token field, not in the gateway URI. Only a `token=` in the URI is hidden in `/status` and `/log`.
 - The token and Wi-Fi password are saved on the board without encryption. Anyone who holds the board and its
   serial port has full control of it.

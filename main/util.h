@@ -35,4 +35,21 @@ void json_escape(char *out, size_t size, const char *src);
 // next line does not run into it.
 void log_mark_truncated(char *line, size_t size);
 
+// Failed-login limiter (one shared instance; the HTTP server handles one request at a time).
+// After max_fails failures in a row, attempts are refused for 30 s, doubling with each further
+// failure up to 15 min. A correct token resets it. Times are milliseconds from any monotonic clock.
+typedef struct {
+    uint32_t fails;
+    int64_t locked_until_ms;
+} auth_limiter_t;
+
+// True while attempts are refused; *retry_s (if not NULL) gets the seconds left, at least 1.
+bool auth_limiter_blocked(const auth_limiter_t *l, int64_t now_ms, uint32_t *retry_s);
+void auth_limiter_fail(auth_limiter_t *l, int64_t now_ms, uint32_t max_fails);
+void auth_limiter_ok(auth_limiter_t *l);
+
+// Light rate limit for open routes: true (and records now) if at least min_gap_ms passed since the
+// last allowed request in *last_ms. Start *last_ms at a very negative value (e.g. INT64_MIN / 2).
+bool rate_gate(int64_t *last_ms, int64_t now_ms, int64_t min_gap_ms);
+
 #endif
