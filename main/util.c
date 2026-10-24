@@ -107,12 +107,29 @@ bool token_equal(const char *given, const char *token)
     return diff == 0;
 }
 
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
 void url_decode(char *s)
 {
     char *out = s;
     for (; *s; s++) {
-        int hi, lo;
-        if (*s == '%' && sscanf(s + 1, "%1x%1x", &hi, &lo) == 2) {
+        // '%' must be followed by exactly two hex digits (no spaces or signs); anything else
+        // stays as typed. s[1] is checked first so s[2] is never read past the NUL.
+        const int hi = *s == '%' ? hex_val(s[1]) : -1;
+        const int lo = hi >= 0 ? hex_val(s[2]) : -1;
+        if (hi >= 0 && lo >= 0) {
             *out++ = (char)(hi << 4 | lo);
             s += 2;
         } else {
@@ -124,6 +141,9 @@ void url_decode(char *s)
 
 void json_escape(char *out, size_t size, const char *src)
 {
+    if (size == 0) {
+        return;  // no room even for the terminator
+    }
     size_t n = 0;
     for (; *src && n + 7 < size; src++) {
         const unsigned char c = (unsigned char)*src;
@@ -137,4 +157,12 @@ void json_escape(char *out, size_t size, const char *src)
         }
     }
     out[n] = '\0';
+}
+
+void log_mark_truncated(char *line, size_t size)
+{
+    static const char mark[] = "...\n";
+    if (size >= sizeof(mark)) {
+        memcpy(line + size - sizeof(mark), mark, sizeof(mark));
+    }
 }

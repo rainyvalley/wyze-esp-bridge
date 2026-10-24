@@ -24,10 +24,15 @@ bool url_encode(char *out, size_t size, const char *src);
 // Compares without an early exit, so the time taken does not reveal how much of a guess matched.
 bool token_equal(const char *given, const char *token);
 
-// Decodes %XX and '+' in a query value in place.
+// Decodes %XX and '+' in a query value in place. A '%' not followed by two hex digits is kept as is.
 void url_decode(char *s);
 
-// Writes src as the contents of a JSON string (without quotes), truncating to fit.
+// Writes src as the contents of a JSON string (without quotes), truncating to fit. size 0 writes nothing.
 void json_escape(char *out, size_t size, const char *src);
+
+// For a log line that did not fit its buffer: overwrites the end of line (a buffer of `size`
+// bytes, already NUL-terminated by snprintf) with "...\n", so a cut line is visible and the
+// next line does not run into it.
+void log_mark_truncated(char *line, size_t size);
 
 #endif

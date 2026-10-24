@@ -313,6 +313,35 @@ void test_decode_malformed_escapes_kept_verbatim(void)
     TEST_ASSERT_EQUAL_STRING("a% zz%2", s);
 }
 
+void test_decode_percent_space_not_decoded(void)
+{
+    // sscanf-based decoding used to turn "% 41" into "A1"
+    char s[] = "% 41";
+    url_decode(s);
+    TEST_ASSERT_EQUAL_STRING("% 41", s);
+}
+
+void test_decode_percent_sign_not_decoded(void)
+{
+    char s[] = "%+4%-1";
+    url_decode(s);
+    TEST_ASSERT_EQUAL_STRING("% 4%-1", s);
+}
+
+void test_decode_half_hex_kept(void)
+{
+    char s[] = "%4g%g4%4";
+    url_decode(s);
+    TEST_ASSERT_EQUAL_STRING("%4g%g4%4", s);
+}
+
+void test_decode_upper_and_lower_hex(void)
+{
+    char s[] = "%4a%4A%7e";
+    url_decode(s);
+    TEST_ASSERT_EQUAL_STRING("JJ~", s);
+}
+
 void test_decode_trailing_percent_kept(void)
 {
     char s[] = "abc%";
@@ -438,11 +467,22 @@ void test_json_escape_stops_before_partial_escape(void)
     TEST_ASSERT_EQUAL_STRING("a\\\\bd", out);
 }
 
-void test_json_escape_size_zero_is_empty(void)
+void test_json_escape_small_buffer_is_empty(void)
 {
+    // too small for any escape headroom: nothing copied, still terminated
     char out[4] = "zz";
     json_escape(out, sizeof(out), "abc");
     TEST_ASSERT_EQUAL_STRING("", out);
+}
+
+void test_json_escape_size_zero_writes_nothing(void)
+{
+    // size 0 used to write out[0]; the neighbours are canaries that must stay untouched
+    char buf[3] = {'C', 'X', 'C'};
+    json_escape(buf + 1, 0, "abc");
+    TEST_ASSERT_EQUAL_UINT8('C', buf[0]);
+    TEST_ASSERT_EQUAL_UINT8('X', buf[1]);
+    TEST_ASSERT_EQUAL_UINT8('C', buf[2]);
 }
 
 void test_json_escape_nul_never_touched_when_full(void)
@@ -451,6 +491,33 @@ void test_json_escape_nul_never_touched_when_full(void)
     char out[10] = "WWWWWWWWW";
     json_escape(out, sizeof(out), "\\");  // 0 + 7 < 10 writes the pair; then src is exhausted
     TEST_ASSERT_EQUAL_STRING("\\\\", out);
+}
+
+// ------------------------------------------------------------------ log_mark_truncated
+
+void test_mark_truncated_ends_line_visibly(void)
+{
+    char line[16];
+    memset(line, 'x', sizeof(line) - 1);
+    line[sizeof(line) - 1] = '\0';
+    log_mark_truncated(line, sizeof(line));
+    TEST_ASSERT_EQUAL_STRING("xxxxxxxxxxx...\n", line);
+    TEST_ASSERT_EQUAL_UINT(15, strlen(line));
+}
+
+void test_mark_truncated_tiny_buffer_untouched(void)
+{
+    char line[4] = "abc";
+    log_mark_truncated(line, sizeof(line));
+    TEST_ASSERT_EQUAL_STRING("abc", line);
+}
+
+void test_cut_line_with_token_is_redacted(void)
+{
+    // a long line cut mid-token: what is left of the value must still be masked
+    char line[24] = "uri ws://h/ws?token=abc";
+    TEST_ASSERT_TRUE(log_redact_token(line));
+    TEST_ASSERT_NULL(strstr(line, "abc"));
 }
 
 // ------------------------------------------------------------------ fuzz-ish combined
@@ -505,6 +572,10 @@ int main(void)
     RUN_TEST(test_decode_leaves_plain_plus_only_where_encoded);
     RUN_TEST(test_decode_in_place_overlap);
     RUN_TEST(test_decode_malformed_escapes_kept_verbatim);
+    RUN_TEST(test_decode_percent_space_not_decoded);
+    RUN_TEST(test_decode_percent_sign_not_decoded);
+    RUN_TEST(test_decode_half_hex_kept);
+    RUN_TEST(test_decode_upper_and_lower_hex);
     RUN_TEST(test_decode_trailing_percent_kept);
     RUN_TEST(test_decode_empty);
     RUN_TEST(test_decode_noop);
@@ -522,8 +593,12 @@ int main(void)
     RUN_TEST(test_json_escape_truncates_to_fit);
     RUN_TEST(test_json_escape_plain_text_uses_headroom);
     RUN_TEST(test_json_escape_stops_before_partial_escape);
-    RUN_TEST(test_json_escape_size_zero_is_empty);
+    RUN_TEST(test_json_escape_small_buffer_is_empty);
+    RUN_TEST(test_json_escape_size_zero_writes_nothing);
     RUN_TEST(test_json_escape_nul_never_touched_when_full);
+    RUN_TEST(test_mark_truncated_ends_line_visibly);
+    RUN_TEST(test_mark_truncated_tiny_buffer_untouched);
+    RUN_TEST(test_cut_line_with_token_is_redacted);
     RUN_TEST(test_redact_after_escape_still_masks_uri_token);
     return UNITY_END();
 }
