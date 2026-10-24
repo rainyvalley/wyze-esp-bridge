@@ -37,6 +37,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
@@ -114,7 +115,13 @@ static int log_vprintf(const char *fmt, va_list args)
     if (n <= 0) {
         return vprintf(fmt, args);
     }
-    const bool redacted = log_redact_token(line);
+    // A line that did not fit is cut at the buffer end. Redact the cut copy, mark it, and print
+    // that copy (not the full original) so a token past the cut cannot reach the UART.
+    const bool truncated = n >= (int)sizeof(line);
+    if (truncated) {
+        log_mark_truncated(line, sizeof(line));
+    }
+    const bool redacted = log_redact_token(line) || truncated;
     const size_t len = strlen(line);
     taskENTER_CRITICAL(&s_log_lock);
     size_t idx = s_log_written % LOG_BUF_SIZE;
@@ -127,7 +134,7 @@ static int log_vprintf(const char *fmt, va_list args)
     }
     s_log_written += len;
     taskEXIT_CRITICAL(&s_log_lock);
-    // Print the redacted copy (possibly truncated) rather than leak the token on the UART too.
+    // Print the redacted/cut copy rather than leak the token on the UART too.
     return redacted ? printf("%s", line) : vprintf(fmt, args);
 }
 
@@ -306,7 +313,10 @@ static bool prompt(const char *label, char *field, size_t size, bool secret, boo
 static void console_setup(void)
 {
     ESP_ERROR_CHECK(uart_driver_install(CONSOLE_UART, 256, 0, 0, NULL, 0));
-    printf("\nGateway %s\nPress Enter within 3 s to change settings...\n", s_cfg.uri);
+    char shown[sizeof(s_cfg.uri)];
+    strlcpy(shown, s_cfg.uri, sizeof(shown));
+    log_redact_token(shown);  // a token= in the URI must not show on the console either
+    printf("\nGateway %s\nPress Enter within 3 s to change settings...\n", shown);
     if (!console_wait_enter(pdMS_TO_TICKS(3000))) {
         return;
     }
@@ -356,10 +366,14 @@ static EventGroupHandle_t s_events;
 static QueueHandle_t s_hid_driver_q;  // new HID devices (driver callback -> app task)
 static QueueHandle_t s_to_gateway_q;  // dongle -> gateway frames
 static QueueHandle_t s_to_dongle_q;   // gateway -> dongle frames
-// s_dongle_lock guards s_dongle and s_dongle_gone, and is held across every SET_REPORT so the
+// s_dongle_lock guards s_dongle, s_dongle_opening, s_open_aborted and s_dongle_gone, and is held across every SET_REPORT so the
 // HID driver cannot tear the device down underneath an in-flight control transfer.
 static SemaphoreHandle_t s_dongle_lock;
 static hid_host_device_handle_t s_dongle;
+// The dongle handle while open_hid_device is still setting it up (also under s_dongle_lock). A
+// disconnect in that window cannot see s_dongle yet, so it flags s_open_aborted instead.
+static hid_host_device_handle_t s_dongle_opening;
+static bool s_open_aborted;
 static size_t s_dongle_out_len;  // output report size in bytes; larger gateway packets are not sent
 static bool s_dongle_gone;
 // s_ws_lock guards s_ws for tasks other than the main loop (the only writer): it is held across
@@ -708,6 +722,8 @@ static void hid_interface_cb(hid_host_device_handle_t handle, const hid_host_int
         if (handle == s_dongle) {
             s_dongle = NULL;
             s_dongle_gone = true;
+        } else if (handle == s_dongle_opening) {
+            s_open_aborted = true;  // open_hid_device sees this and does not publish the handle
         }
         xSemaphoreGive(s_dongle_lock);
         hid_host_device_close(handle);
@@ -780,21 +796,44 @@ static void open_hid_device(hid_host_device_handle_t handle)
         ESP_LOGI(TAG, "ignoring HID device %04x:%04x", info.VID, info.PID);
         return;
     }
-    if (s_dongle) {
+    // Register the handle before opening it: once open returns, a disconnect callback can run at
+    // any time, and it must be able to tell this handle apart from "no dongle".
+    xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+    if (s_dongle || s_dongle_opening) {
+        xSemaphoreGive(s_dongle_lock);
         ESP_LOGW(TAG, "a Wyze dongle is already in use, ignoring the second one");
         return;
     }
+    s_dongle_opening = handle;
+    s_open_aborted = false;
+    xSemaphoreGive(s_dongle_lock);
     const hid_host_device_config_t dev_config = {.callback = hid_interface_cb, .callback_arg = NULL};
     if (hid_host_device_open(handle, &dev_config) != ESP_OK) {
         ESP_LOGE(TAG, "failed to open Wyze dongle");
+        xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+        s_dongle_opening = NULL;
+        xSemaphoreGive(s_dongle_lock);
         return;
     }
     if (hid_host_device_start(handle) != ESP_OK) {
         ESP_LOGE(TAG, "failed to start Wyze dongle");
-        hid_host_device_close(handle);
+        xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+        const bool closed = s_open_aborted;  // the disconnect callback already closed it
+        s_dongle_opening = NULL;
+        xSemaphoreGive(s_dongle_lock);
+        if (!closed) {
+            hid_host_device_close(handle);
+        }
         return;
     }
     xSemaphoreTake(s_dongle_lock, portMAX_DELAY);
+    if (s_open_aborted) {
+        // The dongle vanished while it was being opened; the callback has closed the handle.
+        s_dongle_opening = NULL;
+        xSemaphoreGive(s_dongle_lock);
+        ESP_LOGW(TAG, "Wyze dongle disconnected while opening; waiting for it to come back");
+        return;
+    }
     // The descriptor read is a control transfer: do it under the lock, like SET_REPORT, so a
     // disconnect in the middle waits for it (see HID_HOST_INTERFACE_EVENT_DISCONNECTED). Called
     // only once per device: usb_host_hid 1.0.4 keeps a failed read's buffer and returns it later.
@@ -810,6 +849,7 @@ static void open_hid_device(hid_host_device_handle_t handle)
     }
     s_dongle_out_len = out_len;
     s_dongle = handle;  // s_dongle_gone stays set until the main loop recycles the WebSocket
+    s_dongle_opening = NULL;
     xSemaphoreGive(s_dongle_lock);
     ESP_LOGI(TAG, "Wyze dongle up, connecting to gateway");
 }
@@ -857,7 +897,9 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "gateway connected");
         s_gateway_seen = true;  // the main loop confirms a new OTA image (ota_confirm_poll)
+        // Frames queued during the gap belong to the old session: drop them both ways.
         xQueueReset(s_to_dongle_q);
+        xQueueReset(s_to_gateway_q);
         s_rx_active = false;
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
@@ -914,7 +956,7 @@ static void ws_start(void)
     }
     const esp_websocket_client_config_t cfg = {
         .uri = uri,
-        .reconnect_timeout_ms = 5000,
+        .reconnect_timeout_ms = 5000 + (int)(esp_random() % 5000),  // 5-10 s: bridges do not retry in step
         .network_timeout_ms = 10000,
         .buffer_size = 1024,
     };
@@ -1017,6 +1059,8 @@ static bool ota_confirm_poll(net_kind_t net, int64_t *net_since_us)
 
 // ---------------------------------------------------------------- HTTP: status, log, OTA
 
+#define UNAUTHORIZED_DELAY_MS 500
+
 // Accepts the bridge token as "Authorization: Bearer <token>" or ?token=<token>.
 static bool http_authorized(httpd_req_t *req)
 {
@@ -1042,6 +1086,29 @@ static bool http_authorized(httpd_req_t *req)
     }
     url_decode(token);
     return token_equal(token, s_cfg.token);
+}
+
+// Rejects with 401. The request body is read and dropped first (up to 4 KB; for a larger one the
+// connection is closed instead) so it is not parsed as the next request. The short delay slows
+// down token guessing, since the HTTP server handles one request at a time.
+static esp_err_t http_unauthorized(httpd_req_t *req)
+{
+    char scratch[128];
+    size_t left = req->content_len;
+    if (left > 4096) {
+        httpd_resp_set_hdr(req, "Connection", "close");
+    } else {
+        while (left > 0) {
+            const int n = httpd_req_recv(req, scratch, left < sizeof(scratch) ? left : sizeof(scratch));
+            if (n <= 0) {
+                break;
+            }
+            left -= n;
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(UNAUTHORIZED_DELAY_MS));
+    httpd_resp_set_status(req, "401 Unauthorized");
+    return httpd_resp_sendstr(req, "bad or missing token\n");
 }
 
 static esp_err_t status_get(httpd_req_t *req)
@@ -1125,8 +1192,7 @@ static void restart_task(void *arg)
 static esp_err_t ota_post(httpd_req_t *req)
 {
     if (!http_authorized(req)) {
-        httpd_resp_set_status(req, "401 Unauthorized");
-        return httpd_resp_sendstr(req, "bad or missing token\n");
+        return http_unauthorized(req);
     }
     if (ota_pending_verify()) {
         // esp_ota_begin() refuses this state (ESP_ERR_OTA_ROLLBACK_INVALID_STATE); say why.
@@ -1193,8 +1259,7 @@ static esp_err_t ota_post(httpd_req_t *req)
 static esp_err_t reboot_post(httpd_req_t *req)
 {
     if (!http_authorized(req)) {
-        httpd_resp_set_status(req, "401 Unauthorized");
-        return httpd_resp_sendstr(req, "bad or missing token\n");
+        return http_unauthorized(req);
     }
     httpd_resp_sendstr(req, "rebooting\n");
     xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);
@@ -1274,8 +1339,8 @@ void app_main(void)
 
     // Open the gateway connection only while the dongle is present and the network is up,
     // so the gateway sees a disconnect when the dongle is unplugged. The WebSocket
-    // client reconnects on its own; a wedged client (task exited, stale handle)
-    // is detected via the not-connecting state and torn down so the loop remakes it.
+    // client reconnects on its own; a client that stays
+    // disconnected for about 2 min is torn down so the loop remakes it.
     uint32_t last_frames = UINT32_MAX;
     int wedged_polls = 0;
     net_kind_t ws_net = NET_NONE;
@@ -1311,13 +1376,13 @@ void app_main(void)
             last_frames = UINT32_MAX;
             wedged_polls = 0;
         } else if (s_ws) {
-            // Client should be either connected or retrying; both make frame
-            // progress or keep the handle busy. If several minutes pass with
-            // no frames and no connection, rebuild it from scratch.
+            // The client is either connected or retrying on its own. If it has not been
+            // connected for about 2 min and no frames moved, restart it from scratch (fresh
+            // DNS lookup and socket). This also fires when the gateway is simply down.
             bool connected = esp_websocket_client_is_connected(s_ws);
             if (!connected && s_frames_up + s_frames_down == last_frames) {
                 if (++wedged_polls > 240) {  // 240 x 500 ms = ~2 min
-                    ESP_LOGW(TAG, "gateway client wedged, rebuilding");
+                    ESP_LOGW(TAG, "no gateway connection for 2 min, restarting the client");
                     wedged_polls = 0;
                     ws_stop();
                 }
