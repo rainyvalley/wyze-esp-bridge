@@ -2,8 +2,8 @@
 # Builds board variants into out/. Run inside espressif/idf:release-v5.5:
 #   docker run --rm -v "$PWD":/project -w /project espressif/idf:release-v5.5 ./build.sh
 # With arguments, builds exactly one variant: ./build.sh p4 esp32p4 [extra-defaults]
-# (same positional args as build() below). No arguments = the previous behavior:
-# all three board variants. The variants run sequentially, not in parallel, because
+# (same positional args as build() below). No arguments builds all three board
+# variants. The variants run sequentially, not in parallel, because
 # idf.py does not like two builds sharing a project directory.
 set -e
 mkdir -p out

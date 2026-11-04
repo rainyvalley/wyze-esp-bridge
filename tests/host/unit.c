@@ -1,7 +1,9 @@
 // Host unit tests for main/util.c, built standalone (no ESP-IDF):
-//   cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined
-//      -Imain tests/host/unit.c main/util.c tests/host/unity/unity.c -o /tmp/unit
-// The same command runs in CI (release.yml, "tests" job). Semantics are the firmware's,
+//   cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+//      -Imain -Itests/host/unity tests/host/unit.c main/util.c \
+//      tests/host/unity/unity.c -o /tmp/unit
+// CI (release.yml, "tests" job) runs the same command with its own flags.
+// Semantics are the firmware's,
 // so every case here documents real behavior, including the quirks it relies on.
 #include "unity.h"
 
@@ -315,7 +317,7 @@ void test_decode_malformed_escapes_kept_verbatim(void)
 
 void test_decode_percent_space_not_decoded(void)
 {
-    // sscanf-based decoding used to turn "% 41" into "A1"
+    // sscanf-based decoding would turn "% 41" into "A1"
     char s[] = "% 41";
     url_decode(s);
     TEST_ASSERT_EQUAL_STRING("% 41", s);

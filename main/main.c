@@ -11,13 +11,13 @@
 // Network: Ethernet is preferred whenever it has an IP; Wi-Fi (if an SSID is set) covers the
 // gaps and is stopped once Ethernet gets an address. Never both in use at once.
 //
-// Dongle -> gateway: each 64-byte HID input report is [len][len protocol bytes][stale];
-//   only the protocol bytes are forwarded, one binary frame per report.
+// Dongle -> gateway: a report starting 0x55/0xAA is forwarded whole; otherwise
+//   the first byte is a length and only that many bytes are forwarded.
 // Gateway -> dongle: each binary frame is one protocol packet, written as a HID
 //   SET_REPORT (Output, report ID 0). The dongle has no interrupt OUT endpoint.
 //
 // Gateway settings live in NVS and are set from the console. An HTTP server on port 80
-// serves /status and /log, and takes firmware updates on POST /ota.
+// serves /, /status and /log, and takes POST /ota and POST /reboot.
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -438,9 +438,8 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         ESP_LOGI(TAG, "ethernet link up (uptime_s=%lld)", (long long)(esp_timer_get_time() / 1000000));
         xEventGroupSetBits(s_events, ETH_LINK_BIT);
     } else if (base == ETH_EVENT && id == ETHERNET_EVENT_DISCONNECTED) {
-        // Diagnostics for the periodic ~25.5 min session-kill: prove whether
-        // the link physically drops (PHY EEE/PoE class) vs the TCP dying
-        // inside a healthy link. Uptime+frames pin the cause to this event.
+        // Log the link event with uptime and frame counts so a dropped
+        // session can be traced to a link loss or to the TCP path.
         ESP_LOGW(TAG, "ethernet link down (uptime_s=%lld frames=%lu/%lu)",
                  (long long)(esp_timer_get_time() / 1000000), (unsigned long)s_frames_up,
                  (unsigned long)s_frames_down);
@@ -642,8 +641,7 @@ static net_kind_t net_active(void)
 
 // The CH9350 sometimes misses the first post-settle enumeration (the single
 // boot bounce isn't always enough); a physical replug always heals it. Emulate
-// that with exactly ONE extra power bounce. Hard rules from the 2.2.0 crash
-// (assert in hub_root_stop, hub.c:888):
+// that with exactly ONE extra power bounce. Hard rules:
 //  - never loop: each bounce can leave the HCD port mid-recovery; a bounce
 //    landing in that window escalates to an abort
 //  - fire late (+8 s after power-on) so the port is in a settled state,
@@ -651,8 +649,8 @@ static net_kind_t net_active(void)
 //  - skip entirely once the dongle is up
 // It runs in its own short-lived task (created once, deletes itself), not an esp_timer
 // callback: the 200 ms power-off sleep would block every other esp_timer callback (Wi-Fi
-// retry, IDF component timers). Timing and the calls themselves are unchanged; usb_lib_task
-// keeps handling hub events during the sleep, as it did when this was a timer callback.
+// retry, IDF component timers). usb_lib_task keeps handling hub events during
+// the sleep.
 #if CONFIG_IDF_TARGET_ESP32P4
 #define USB_REPLUG_DELAY_MS 8000
 
@@ -768,7 +766,7 @@ static void usb_lib_task(void *arg)
     ESP_LOGI(TAG, "root port power on");
     // +8 s after power-on: past debounce(300ms)+reset+recovery windows; the
     // task re-checks s_dongle before bouncing, so an on-time dongle skips it.
-    // Core 0 and a priority above this task's (2), like the esp_timer task it replaces.
+    // Core 0 and a priority above this task's (2).
     if (xTaskCreatePinnedToCore(usb_replug_task, "usb_replug", 4096, NULL, 5, NULL, 0) != pdPASS) {
         ESP_LOGE(TAG, "could not start the replug task; replug the dongle by hand if it does not come up");
     }

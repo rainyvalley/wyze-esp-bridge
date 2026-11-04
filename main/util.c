@@ -1,5 +1,5 @@
-// util.c — pure string/descriptor helpers extracted verbatim from main.c so they can
-// be unit-tested on the host (tests/host/). No ESP-IDF headers: these must stay
+// util.c — pure string/descriptor helpers for main.c and the host unit tests
+// (tests/host/). No ESP-IDF headers: these must stay
 // freestanding C (C11) and be callable from both the firmware and the host tests.
 #include "util.h"
 
