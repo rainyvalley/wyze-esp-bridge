@@ -178,7 +178,7 @@ If the board comes back on the old version, the new firmware was rolled back. Re
 | `POST /reboot` | Restarts the board. | yes |
 
 The token goes in the `Authorization: Bearer` header. `?token=` in the address also works, with the
-token written in URL form (for example `%2B` for `+`). A header is safer, because addresses end up in logs.
+token written in URL form (for example `%2B` for `+`). A header keeps the token out of addresses and logs.
 
 ## Security
 
@@ -249,7 +249,7 @@ Maintainer notes, including the data flow and known pitfalls, are in [AGENTS.md]
 
 `case/wyze_esp_bridge_p4_case.scad` is a 3D-printable OpenSCAD case for the P4 board
 (60 x 74.3 x 27.1 mm, snap-fit or M2.5 screws). Previews are in `case/*.png`. The `.scad` file explains
-the print settings and the values marked `MEASURE`. `case/wyze_esp_bridge_case.scad` is for an old S3 build and is obsolete.
+the print settings and the values marked `MEASURE`. `case/wyze_esp_bridge_case.scad` is the S3 board case.
 
 ## A note on AI assistance
 
