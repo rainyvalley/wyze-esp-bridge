@@ -1,7 +1,7 @@
 // Enclosure for wyze-esp-bridge on the Waveshare ESP32-P4-WIFI6-POE-ETH.
 //
-// The board sits on four standoffs. The lid has matching spacer tubes, so four M2.5 screws go
-// lid -> tube -> PCB -> standoff and hold both the board and the lid.
+// The board sits on four standoffs and locates on their pins; the lid clips on (fixing = "clips").
+// With fixing = "screws", four M2.5 screws go lid -> tube -> PCB -> standoff and hold the lid too.
 // Front wall: stacked USB-A (dongle) / USB-C (power, console), RJ45 (PoE), TF card.
 // Left wall: RESET and BOOT button holes (press with a pin). Lid: PWR LED hole, vents over the PoE supply.
 //
@@ -28,8 +28,8 @@ conn_ovh = 1.75;         // connectors stick out past the PCB edge
 /* [Front connectors (x = centre from the left edge; z relative to the PCB top)] */
 usb_x = 12.2;
 usba_w = 13.6;     // USB-A shell width
-usba_z0 = 0.0;     // USB-A shell bottom                                                    MEASURE
 usba_h = 7.0;      // USB-A shell height                                                    MEASURE
+usba_z0 = 5.75;    // USB-A shell bottom above the PCB top (5.5-6 mm measured)              MEASURE
 usbc_zc = -3.2;    // USB-C centre (the stack's USB-C sits below the PCB)                   MEASURE
 usbc_open_w = 12.5; // opening for a USB-C plug's overmold
 usbc_open_h = 7.0;
@@ -63,7 +63,7 @@ roof_extra = 2;      // extra height above top_clear: keeps the wall above the R
 snap = true;         // groove inside the base walls + ridge on the lid lip: the lid clicks on without screws
 snap_depth = 0.5;    // groove depth into the wall
 snap_h = 1.4;        // groove height
-snap_grip = 0.3;     // how far the lid ridge reaches into the groove (more = tighter, tune for your printer)
+snap_grip = 0.45;    // how far the lid ridge reaches into the groove (more = tighter, tune for your printer)
 standoff_d = 6;
 pilot_d = 2.2;     // 2.2 for M2.5 self-tapping into plastic, 3.6 for M2.5 heat-set inserts
 tube_d = 5.4;      // lid spacer tubes
@@ -74,12 +74,20 @@ vents = true;
 ears = false;      // screw-down tabs on the left and right
 ear_hole_d = 4.2;
 
+/* [Fixing] */
+fixing = "clips"; // [clips, screws]
+pin_d = 2.55;     // locating pin, fits the 2.7 mm board holes
+pin_extra = 0.4;  // how far the pin stands above the PCB top
+clamp = 0.1;      // clips: how far the lid boss presses into the PCB
+
 $fn = 40;
 eps = 0.01;
 
 // ------------------------------------------------------------------ layout
 
 standoff_h = below_clear + 1;
+use_snap = snap || fixing == "clips";   // clips need the snap lip
+pin_h = pcb_t + pin_extra;
 in_w = board_w + 2 * clr;
 in_d = board_d + conn_ovh + clr;
 in_h = standoff_h + pcb_t + top_clear + roof_extra;
@@ -94,7 +102,7 @@ bz = floor_t + standoff_h + pcb_t;    // PCB top
 
 screw_len = lid_t + top_clear + roof_extra + pcb_t + standoff_h + floor_t - 0.6 - 0.5;   // longest that fits
 echo(str("Outer size: ", out_w, " x ", out_d, " x ", out_h + lid_t, " mm (with lid)"));
-echo(str("Screws: 4x M2.5, ", floor(screw_len) - 2, "-", floor(screw_len), " mm long"));
+echo(fixing == "clips" ? "Fixing: clip-on lid with locating pins" : str("Screws: 4x M2.5, ", floor(screw_len) - 2, "-", floor(screw_len), " mm long"));
 echo(str("Wall above the RJ45 opening: ", out_h - (bz + rj_z0 + rj_h + conn_clr), " mm"));
 echo("Check every value marked MEASURE with calipers before printing.");
 
@@ -139,7 +147,7 @@ module base() {
         if (tf_open) front_cut(tf_x, tf_w, tf_z0, tf_h);
         for (y = btn_y)
             translate([-eps, by + y, bz + btn_z]) rotate([0, 90, 0]) cylinder(d = btn_d, h = wall + 2 * eps);
-        if (snap) {
+        if (use_snap) {
             // left and right inner walls (strip along Y, cutting outward)
             translate([wall + eps, wall, snap_z]) rotate([0, 0, 90]) ridge(in_d, snap_depth + eps, snap_h);
             translate([wall + in_w - eps, wall + in_d, snap_z]) rotate([0, 0, -90]) ridge(in_d, snap_depth + eps, snap_h);
@@ -147,19 +155,27 @@ module base() {
             translate([wall, wall + in_d - eps, snap_z]) ridge(in_w, snap_depth + eps, snap_h);
         }
     }
-    // Standoffs
+    // Standoffs: screw pilots, or solid locating pins under a clip-on lid
     for (x = hole_x, y = hole_y)
-        translate([bx + x, by + y, floor_t - eps])
-            difference() {
-                cylinder(d = standoff_d, h = standoff_h + eps);
-                translate([0, 0, 0.6 - floor_t]) cylinder(d = pilot_d, h = standoff_h + floor_t);   // pilot runs into the floor
-            }
+        translate([bx + x, by + y, floor_t - eps]) {
+            if (fixing == "screws")
+                difference() {
+                    cylinder(d = standoff_d, h = standoff_h + eps);
+                    translate([0, 0, 0.6 - floor_t]) cylinder(d = pilot_d, h = standoff_h + floor_t);   // pilot runs into the floor
+                }
+            else
+                union() {
+                    cylinder(d = standoff_d, h = standoff_h + eps);
+                    translate([0, 0, standoff_h]) cylinder(d = pin_d, h = pin_h + eps);
+                }
+        }
 }
 
 // ------------------------------------------------------------------ lid (modelled in place, flipped for printing)
 
 module lid() {
-    tube_len = out_h - bz - 0.2;   // down to the PCB top, less 0.2 mm so the screws clamp the PCB
+    // Screws: down to 0.2 mm above the PCB so they clamp it. Clips: press clamp mm into it.
+    tube_len = fixing == "clips" ? out_h - bz + clamp : out_h - bz - 0.2;
     difference() {
         union() {
             translate([0, 0, out_h]) cube([out_w, out_d, lid_t]);
@@ -174,7 +190,7 @@ module lid() {
                 translate([lx0, ly1 - lip_t, 0]) cube([lx1 - lx0, lip_t, lip_h + eps]);
             }
             // Snap ridges on the lip's outer faces, matching the base grooves
-            if (snap) {
+            if (use_snap) {
                 rd = lip_clr + snap_grip;
                 rh = snap_h - 0.4;
                 rz = snap_z + 0.2;
@@ -186,11 +202,17 @@ module lid() {
             for (x = hole_x, y = hole_y)
                 translate([bx + x, by + y, out_h - tube_len]) cylinder(d = tube_d, h = tube_len + eps);
         }
-        // Screw holes with counterbores
-        for (x = hole_x, y = hole_y) translate([bx + x, by + y, 0]) {
-            translate([0, 0, bz - eps]) cylinder(d = screw_clear_d, h = out_h - bz + lid_t + 2 * eps);
-            translate([0, 0, out_h + lid_t - head_h]) cylinder(d = head_d, h = head_h + eps);
-        }
+        if (fixing == "screws")
+            // Screw holes with counterbores
+            for (x = hole_x, y = hole_y) translate([bx + x, by + y, 0]) {
+                translate([0, 0, bz - eps]) cylinder(d = screw_clear_d, h = out_h - bz + lid_t + 2 * eps);
+                translate([0, 0, out_h + lid_t - head_h]) cylinder(d = head_d, h = head_h + eps);
+            }
+        else
+            // Pocket for the locating pin; the ring around it presses the PCB
+            for (x = hole_x, y = hole_y)
+                translate([bx + x, by + y, out_h - tube_len - eps])
+                    cylinder(d = pin_d + 0.6, h = pin_extra + clamp + 0.2 + 2 * eps);
         // PWR LED light hole
         translate([bx + led_xy[0], by + led_xy[1], out_h - eps]) cylinder(d = led_d, h = lid_t + 2 * eps);
         // Vents over the PoE transformer and capacitors
