@@ -25,9 +25,19 @@ menu "Wyze ESP bridge"
         default 5
         range 1 100
         help
-            After this many wrong tokens in a row on /ota or /reboot, further attempts are refused
-            (429) for 30 s, doubling with each further wrong try up to 15 min. The lockout is shared
-            by all clients, and clears on a correct token or a restart.
+            After this many wrong tokens in a row on /ota, /reboot or the setup page, further
+            attempts are refused (429) for 30 s, doubling with each further wrong try up to 15 min.
+            The lockout is shared by all clients and by all of those routes, and clears on a correct
+            token or password, or a restart.
+
+    config WYZE_SETUP_PASSWORD
+        string "Default password of the /setup page"
+        default "wyzebridge"
+        help
+            Unlocks the settings page until a different one is chosen on the page or the console
+            (which then overrides this; either can reset it to this value). 8-63 printable
+            characters. The default is published in the README, so change it. The bridge token
+            also unlocks the page.
 
     config WYZE_WIFI_SSID
         string "WiFi SSID (baked default)"
@@ -41,5 +51,84 @@ menu "Wyze ESP bridge"
         default ""
         help
             Initial value before NVS is populated; console setup also writes it.
+
+    config WYZE_ALARM_REPLAY_DELAY_S
+        int "Seconds to wait after the gateway connects before replaying held alarms"
+        default 10
+        range 0 120
+        help
+            While the gateway is unreachable the bridge holds up to 32 sensor alarm/leak reports.
+            The gateway redoes its dongle handshake on every connection, so replay starts only
+            once the link has been up this long. Reports keep the dongle's original timestamp.
+
+    config WYZE_ALARM_MAX_AGE_S
+        int "Drop held alarms older than this many seconds"
+        default 600
+        range 10 86400
+        help
+            A door that opened an hour ago is not news. Older held reports are discarded
+            instead of replayed (counted as alarms_lost in /status).
+
+    config WYZE_LOG_PERSIST
+        bool "Keep the log tail across restarts (snapshots in flash)"
+        default y
+        help
+            Saves the end of the RAM log to the last 64 KB of the 16 MB flash (outside every
+            partition, so OTA is unaffected) and shows it in front of the current log in /log.
+            Nothing is written if that flash area overlaps a partition or the flash is smaller.
+
+    config WYZE_LOG_SNAPSHOT_MINUTES
+        int "Minutes between log snapshots (only when the log changed)"
+        default 20
+        range 5 240
+        depends on WYZE_LOG_PERSIST
+        help
+            Each snapshot erases and rewrites 32 KB, alternating between two slots; a restart you
+            ask for (settings, OTA, reboot) saves one at once, and a warning or error line saves one
+            a few seconds later (4 in a row, then one per 10 minutes). A power cut or crash loses what was
+            logged since the last snapshot. A healthy board logs almost nothing, so most intervals
+            write nothing.
+
+    config WYZE_SETUP_AP
+        bool "Open a setup Wi-Fi access point when the board has no working network"
+        default y
+        help
+            A board with no Ethernet and no Wi-Fi SSID opens an access point named
+            wyze-bridge-XXXX at once; any other board opens it whenever neither Ethernet nor Wi-Fi
+            has had an IP address for WYZE_SETUP_AP_AFTER_S seconds, at boot or later (no cable or
+            DHCP, wrong Wi-Fi password, router gone). A router reboot longer than that opens it too;
+            it closes a minute after the network is back. Join it and open http://192.168.4.1/setup to enter the
+            gateway and Wi-Fi settings. On the ESP32-P4, whose Wi-Fi is a remote co-processor, it
+            needs WYZE_SETUP_AP_HOSTED as well.
+
+    config WYZE_SETUP_AP_HOSTED
+        bool "Experimental: also open the setup access point on the ESP32-P4"
+        default n
+        depends on WYZE_SETUP_AP
+        help
+            Runs the setup access point on the board's ESP32-C6 Wi-Fi co-processor (esp_hosted).
+            Ignored on targets with a native radio. Off by default because it is untested on the
+            Waveshare board's pre-flashed C6 firmware: if it fails the access point just does
+            not appear, but an unconfigured P4 would then still need the serial console.
+
+    config WYZE_SETUP_AP_PASSWORD
+        string "Setup access point password (empty = open network)"
+        default ""
+        depends on WYZE_SETUP_AP
+        help
+            8-63 characters for a WPA2 access point. An open setup AP lets anyone in radio range
+            join the network and reach the setup page, which still asks for the setup password.
+
+    config WYZE_SETUP_AP_AFTER_S
+        int "Seconds without any network address before the setup access point opens"
+        default 180
+        range 30 3600
+        depends on WYZE_SETUP_AP
+
+    config WYZE_SETUP_AP_MINUTES
+        int "Minutes the setup access point stays up when there is no Wi-Fi SSID to fall back to (0 = until reboot)"
+        default 30
+        range 0 1440
+        depends on WYZE_SETUP_AP
 
 endmenu
