@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wyze ESP bridge</title>
+<style>
+:root{--bg:#fff;--fg:#1b1f23;--mut:#656d76;--line:#d8dee4;--card:#f6f8fa;--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--mut:#8b949e;--line:#30363d;--card:#161b22;--ok:#3fb950;--bad:#f85149;--warn:#d29922}}
+*{box-sizing:border-box}
+body{margin:0 auto;max-width:46rem;padding:1rem;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
+h1{font-size:1.25rem;margin:0}h2{font-size:1rem;margin:1.5rem 0 .5rem}
+header{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:.5rem}
+header span,small{color:var(--mut)}
+nav a{margin-left:1rem;color:inherit}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(10.5rem,1fr));gap:.5rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:.5rem .75rem}
+.card b{display:block;font-size:.75rem;font-weight:500;color:var(--mut);text-transform:uppercase;letter-spacing:.03em}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--line);white-space:nowrap}
+th{font-size:.75rem;font-weight:500;color:var(--mut);text-transform:uppercase}
+.scroll{overflow-x:auto}
+#err{color:var(--bad)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Wyze ESP bridge</h1>
+  <span id="ver"></span>
+  <nav><a href="/setup">Setup &amp; log</a><a href="/status">JSON</a></nav>
+</header>
+<p id="err" hidden>Can't reach the bridge.</p>
+
+<h2>Status</h2>
+<div class="grid" id="cards"></div>
+
+<h2>Sensors</h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>Sensor</th><th>Type</th><th>State</th><th>Battery</th><th>Signal</th><th>Last report</th></tr></thead>
+  <tbody id="sensors"></tbody>
+</table>
+</div>
+<p><small id="sensors-note">Sensors appear here once they report to the dongle (a few minutes at most).</small></p>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+function ago(s){
+  if (s < 90) return s + ' s ago';
+  if (s < 5400) return Math.round(s / 60) + ' min ago';
+  if (s < 172800) return Math.round(s / 3600) + ' h ago';
+  return Math.round(s / 86400) + ' d ago';
+}
+function dur(s){
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? d + 'd ' + h + 'h' : h ? h + 'h ' + m + 'm' : m + 'm ' + (s % 60) + 's';
+}
+function card(label, text, cls){
+  const c = document.createElement('div'); c.className = 'card';
+  const b = document.createElement('b'); b.textContent = label;
+  const v = document.createElement('span'); v.textContent = text; if (cls) v.className = cls;
+  c.append(b, v); return c;
+}
+function stateText(s){
+  if (!s.state) return '-';
+  const on = s.state === 'active';
+  if (s.type.startsWith('contact')) return on ? 'open' : 'closed';
+  if (s.type.startsWith('motion')) return on ? 'motion' : 'clear';
+  if (s.type === 'leak') return on ? 'wet' : 'dry';
+  return s.state;
+}
+async function tick(){
+  try {
+    const [st, se] = await Promise.all([
+      fetch('/status').then(r => r.json()), fetch('/sensors').then(r => r.json())]);
+    $('err').hidden = true;
+    $('ver').textContent = 'v' + st.version + ' · ' + st.board + ' · ' + st.partition;
+    const lost = st.alarms_lost || 0;
+    $('cards').replaceChildren(
+      card('Network', st.network === 'none' ? 'offline' : st.network + ' ' + st.ip, st.network === 'none' ? 'bad' : 'ok'),
+      card('Gateway', st.gateway_connected ? 'connected' : 'not connected', st.gateway_connected ? 'ok' : 'bad'),
+      card('Dongle', st.dongle ? 'plugged in' : 'not found', st.dongle ? 'ok' : 'bad'),
+      card('Held alarms', String(st.alarms_held) + (lost ? ' (' + lost + ' lost)' : ''), st.alarms_held ? 'warn' : ''),
+      card('Frames up / down', st.frames_to_gateway + ' / ' + st.frames_to_dongle),
+      card('Uptime', dur(st.uptime_s)),
+      card('Free heap', Math.round(st.free_heap / 1024) + ' KiB'));
+    $('sensors').replaceChildren(...se.map(s => {
+      const tr = document.createElement('tr');
+      const cells = [s.mac, s.type, stateText(s),
+        s.battery_mv == null ? '-' : (s.battery_mv / 1000).toFixed(2) + ' V',
+        s.rssi == null ? '-' : s.rssi + ' dBm', ago(s.age_s)];
+      for (const t of cells) { const td = document.createElement('td'); td.textContent = t; tr.append(td); }
+      return tr;
+    }));
+    $('sensors-note').hidden = se.length > 0;
+  } catch (e) { $('err').hidden = false; }
+}
+tick(); setInterval(tick, 5000);
+</script>
+</body>
+</html>

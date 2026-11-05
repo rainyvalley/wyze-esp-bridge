@@ -1,7 +1,6 @@
 // Host unit tests for main/util.c, built standalone (no ESP-IDF):
-//   cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
-//      -Imain -Itests/host/unity tests/host/unit.c main/util.c \
-//      tests/host/unity/unity.c -o /tmp/unit
+//   cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Imain -Itests/host/unity
+//      tests/host/unit.c main/util.c tests/host/unity/unity.c -o /tmp/unit
 // CI (release.yml, "tests" job) runs the same command with its own flags.
 // Semantics are the firmware's,
 // so every case here documents real behavior, including the quirks it relies on.

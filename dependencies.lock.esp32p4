@@ -14,7 +14,7 @@ dependencies:
       type: service
     version: 1.1.6
   espressif/esp_hosted:
-    component_hash: d72bce4d4a9fd6d4b610f3437735f58c70cfe40abfc969b53396dbb2e1d4c49b
+    component_hash: c88052665d8df3c7185cb5e34327d77674599006bbbbe4bfdb43c44f9a2a73a3
     dependencies:
     - name: idf
       require: private
@@ -35,7 +35,7 @@ dependencies:
     - esp32h4
     - esp32h21
     - esp32p4
-    version: 3.0.9
+    version: 3.0.10
   espressif/esp_serial_slave_link:
     component_hash: ac1776806de0a6e371c84e87898bb983e19ce62aa7f1e2e5c4a3b0234a575d2c
     dependencies:
@@ -76,6 +76,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.6.5
+  espressif/mdns:
+    component_hash: ae75315ecdc03357e40b490cf5b3e8177f98c184236dd93a0e4c6647a18fed67
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.15.0
   espressif/usb:
     component_hash: 1d90d7c7b0682dbfcc36f47cf5acf224a5cfb850a62f39cd86d3159cfec12a81
     dependencies:
@@ -138,9 +148,10 @@ direct_dependencies:
 - espressif/esp_hosted
 - espressif/esp_websocket_client
 - espressif/esp_wifi_remote
+- espressif/mdns
 - espressif/usb
 - espressif/usb_host_hid
 - idf
-manifest_hash: 338ddd7afef1c9f87faa37b7245db42f349110834def49714327ac2ba9478146
+manifest_hash: a77ca85ac6f52f0171077c3e28e3f6341d229c3c47479e61b8ed8ae994bbad59
 target: esp32p4
 version: 2.0.0

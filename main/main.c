@@ -17,11 +17,13 @@
 //   SET_REPORT (Output, report ID 0). The dongle has no interrupt OUT endpoint.
 //
 // Gateway settings live in NVS and are set from the console. An HTTP server on port 80
-// serves /, /status and /log, and takes POST /ota and POST /reboot.
+// serves a status page (/), /status, /sensors and /log, takes firmware updates on POST /ota,
+// and has a settings page (/setup). Boards with no usable network open a setup access point.
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "util.h"
 
@@ -31,12 +33,14 @@
 #include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_eth.h"
+#include "esp_flash.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -50,7 +54,12 @@
 #include "nvs_flash.h"
 #include "soc/soc_caps.h"
 #include "usb/hid_host.h"
+#include "log_dedup.h"
+#include "log_snap.h"
+#include "mdns.h"
+#include "relay_state.h"
 #include "usb/usb_host.h"
+#include "wyze_proto.h"
 
 // Wi-Fi: the S3 has its own radio; the P4 drives the board's ESP32-C6 over SDIO (esp_hosted).
 #if (CONFIG_IDF_TARGET_ESP32P4 && CONFIG_ESP_HOSTED) || SOC_WIFI_SUPPORTED
@@ -105,6 +114,26 @@ static portMUX_TYPE s_log_lock = portMUX_INITIALIZER_UNLOCKED;
 // string, and component code (e.g. the WebSocket client's "Error parse uri = %s") may log
 // that URI; /log is served without auth.
 
+static log_dd_t s_dd;  // repeat collapsing state, guarded by s_log_lock
+// Set (to a nonzero timestamp) by the first warning or error line since the last snapshot; the
+// snapshot task saves the log a few seconds later so a hang right after leaves a trace.
+static volatile uint32_t s_snap_urgent_ms;
+
+static void log_ring_append(const char *s, size_t len)
+{
+    taskENTER_CRITICAL(&s_log_lock);
+    size_t idx = s_log_written % LOG_BUF_SIZE;
+    const size_t contig = LOG_BUF_SIZE - idx;
+    if (len <= contig) {
+        memcpy(s_log + idx, s, len);
+    } else {
+        memcpy(s_log + idx, s, contig);
+        memcpy(s_log, s + contig, len - contig);
+    }
+    s_log_written += len;
+    taskEXIT_CRITICAL(&s_log_lock);
+}
+
 static int log_vprintf(const char *fmt, va_list args)
 {
     char line[256];
@@ -123,20 +152,261 @@ static int log_vprintf(const char *fmt, va_list args)
     }
     const bool redacted = log_redact_token(line) || truncated;
     const size_t len = strlen(line);
-    taskENTER_CRITICAL(&s_log_lock);
-    size_t idx = s_log_written % LOG_BUF_SIZE;
-    const size_t contig = LOG_BUF_SIZE - idx;
-    if (len <= contig) {
-        memcpy(s_log + idx, line, len);
-    } else {
-        memcpy(s_log + idx, line, contig);
-        memcpy(s_log, line + contig, len - contig);
+    // "L (12345) tag: message": a repeat is recognised by what follows the timestamp.
+    const char *msg = line;
+    const char *close = (line[1] == ' ' && line[2] == '(') ? strstr(line, ") ") : NULL;
+    if (close) {
+        msg = close + 2;
     }
-    s_log_written += len;
+    const uint32_t ts = esp_log_timestamp();
+    char note[96];
+    taskENTER_CRITICAL(&s_log_lock);
+    const bool pass = log_dd_pass(&s_dd, msg, ts, note, sizeof(note));
     taskEXIT_CRITICAL(&s_log_lock);
+    if (note[0]) {
+        char note_line[160];
+        snprintf(note_line, sizeof(note_line), "I (%lu) log: %s\n", (unsigned long)ts, note);
+        log_ring_append(note_line, strlen(note_line));
+        printf("%s", note_line);
+    }
+    if (!pass) {
+        return 0;  // a repeat of a line already logged a few times: kept out of the buffer and the UART
+    }
+    if ((line[0] == 'W' || line[0] == 'E') && line[1] == ' ' && !s_snap_urgent_ms) {
+        s_snap_urgent_ms = ts | 1u;
+    }
+    log_ring_append(line, len);
     // Print the redacted/cut copy rather than leak the token on the UART too.
     return redacted ? printf("%s", line) : vprintf(fmt, args);
 }
+
+// ---------------------------------------------------------------- log tail that survives restarts
+
+// The RAM log above is lost on every restart (saving settings, OTA, a crash). A snapshot of its
+// tail is therefore written to flash now and then and shown in front of the current log by
+// /log. It goes into the last 64 KB of the 16 MB flash, which no partition uses (partitions.csv
+// ends at 6.1 MB), as two 32 KB slots written alternately so a power cut mid-write leaves the
+// other one intact. That space is outside the partition table, so OTA updates (which only replace
+// the app) work and the table never needs reflashing; the region is checked against the actual
+// table at boot and nothing is written if anything overlaps it.
+// Writes happen only when the log changed, at most every CONFIG_WYZE_LOG_SNAPSHOT_MINUTES, plus
+// once on every orderly restart; a power cut or crash loses what was logged since the last one.
+#define LOG_RESTART_MARKER "--- restart ---\n"
+
+static char *s_prev;  // text of the log from before this boot, for /log and for the next snapshots
+static size_t s_prev_len;
+
+#if CONFIG_WYZE_LOG_PERSIST
+#define LOGSNAP_BASE 0xFF0000u
+#define LOGSNAP_SLOT_SIZE 0x8000u
+#define LOGSNAP_SLOTS 2
+#define LOGSNAP_TEXT_MAX (LOGSNAP_SLOT_SIZE - LOGSNAP_HDR_SIZE)
+
+static bool s_snap_ok;
+static int s_snap_next_slot;
+static uint32_t s_snap_seq;
+static uint64_t s_snap_written;  // s_log_written when the last snapshot was taken
+
+static bool logsnap_region_ok(void)
+{
+    const uint32_t end = LOGSNAP_BASE + LOGSNAP_SLOTS * LOGSNAP_SLOT_SIZE;
+    uint32_t size = 0;
+    if (esp_flash_get_size(esp_flash_default_chip, &size) != ESP_OK || size < end) {
+        ESP_LOGW(TAG, "log snapshots off: the flash is smaller than 16 MB (%u bytes)", (unsigned)size);
+        return false;
+    }
+    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    while (it) {
+        const esp_partition_t *p = esp_partition_get(it);
+        if (p->address < end && p->address + p->size > LOGSNAP_BASE) {
+            ESP_LOGW(TAG, "log snapshots off: partition \"%s\" overlaps the log area", p->label);
+            esp_partition_iterator_release(it);
+            return false;
+        }
+        it = esp_partition_next(it);
+    }
+    return true;
+}
+
+static uint32_t logsnap_slot_addr(int slot)
+{
+    return LOGSNAP_BASE + (uint32_t)slot * LOGSNAP_SLOT_SIZE;
+}
+
+static void logsnap_load(void)
+{
+    if (!logsnap_region_ok()) {
+        return;
+    }
+    s_snap_ok = true;
+    int best_slot = -1;
+    for (int slot = 0; slot < LOGSNAP_SLOTS; slot++) {
+        logsnap_hdr_t h;
+        if (esp_flash_read(esp_flash_default_chip, &h, logsnap_slot_addr(slot), sizeof(h)) != ESP_OK ||
+            !logsnap_hdr_plausible(&h, LOGSNAP_TEXT_MAX) || (best_slot >= 0 && !logsnap_newer(h.seq, s_snap_seq))) {
+            continue;
+        }
+        char *buf = malloc(h.len);
+        if (!buf) {
+            continue;
+        }
+        if (esp_flash_read(esp_flash_default_chip, buf, logsnap_slot_addr(slot) + LOGSNAP_HDR_SIZE, h.len) != ESP_OK ||
+            logsnap_crc32(0, buf, h.len) != h.crc) {
+            free(buf);  // erased, or a write that never finished
+            continue;
+        }
+        free(s_prev);
+        s_prev = buf;
+        s_prev_len = h.len;
+        s_snap_seq = h.seq;
+        best_slot = slot;
+    }
+    s_snap_next_slot = best_slot >= 0 ? best_slot ^ 1 : 0;
+    if (best_slot >= 0) {
+        ESP_LOGI(TAG, "restored %u bytes of log from before the restart (snapshot %u)", (unsigned)s_prev_len,
+                 (unsigned)s_snap_seq);
+    }
+}
+
+// Copies the newest `want` bytes (want <= the bytes the ring holds) into dst. Small pieces under
+// the spinlock, like log_get: text overwritten while copying can come out garbled, never unsafe.
+static void log_copy_tail(char *dst, size_t want)
+{
+    taskENTER_CRITICAL(&s_log_lock);
+    uint64_t pos = s_log_written > want ? s_log_written - want : 0;
+    taskEXIT_CRITICAL(&s_log_lock);
+    size_t done = 0;
+    while (done < want) {
+        const size_t n = want - done > 512 ? 512 : want - done;
+        taskENTER_CRITICAL(&s_log_lock);
+        if (s_log_written - pos > LOG_BUF_SIZE) {
+            pos = s_log_written - LOG_BUF_SIZE;  // the writer lapped us
+        }
+        for (size_t i = 0; i < n; i++) {
+            dst[done + i] = s_log[(pos + i) % LOG_BUF_SIZE];
+        }
+        taskEXIT_CRITICAL(&s_log_lock);
+        pos += n;
+        done += n;
+    }
+}
+
+static bool logsnap_write(void)
+{
+    char *out = malloc(LOGSNAP_TEXT_MAX);
+    if (!out) {
+        ESP_LOGW(TAG, "log snapshot skipped: out of memory");
+        return false;
+    }
+    taskENTER_CRITICAL(&s_log_lock);
+    const uint64_t written = s_log_written;
+    taskEXIT_CRITICAL(&s_log_lock);
+    const size_t ring = written < LOG_BUF_SIZE ? (size_t)written : LOG_BUF_SIZE;
+    const size_t marker_len = s_prev_len ? sizeof(LOG_RESTART_MARKER) - 1 : 0;
+    const logsnap_layout_t lay = logsnap_layout(s_prev_len, marker_len, ring, LOGSNAP_TEXT_MAX);
+    const size_t total = lay.prev + lay.marker + lay.cur;
+    char *text = out + (LOGSNAP_TEXT_MAX - total);  // previous run, marker, this run: newest last
+    if (lay.prev) {
+        memcpy(text, s_prev + s_prev_len - lay.prev, lay.prev);
+    }
+    if (lay.marker) {
+        memcpy(text + lay.prev, LOG_RESTART_MARKER + (marker_len - lay.marker), lay.marker);
+    }
+    log_copy_tail(text + lay.prev + lay.marker, lay.cur);
+    const size_t skip = lay.cut ? logsnap_line_start(text, total) : 0;
+    text += skip;
+    const size_t len = total - skip;
+    esp_err_t err = len ? ESP_OK : ESP_ERR_INVALID_SIZE;
+    const logsnap_hdr_t hdr = {LOGSNAP_MAGIC, s_snap_seq + 1, (uint32_t)len, logsnap_crc32(0, text, len)};
+    const uint32_t base = logsnap_slot_addr(s_snap_next_slot);
+    // The header goes last: until then the slot does not look valid, and the other one still is.
+    for (uint32_t off = 0; off < LOGSNAP_SLOT_SIZE && err == ESP_OK; off += 4096) {
+        err = esp_flash_erase_region(esp_flash_default_chip, base + off, 4096);
+        vTaskDelay(1);  // let the USB and network tasks in between sectors
+    }
+    if (err == ESP_OK) {
+        err = esp_flash_write(esp_flash_default_chip, text, base + LOGSNAP_HDR_SIZE, len);
+    }
+    if (err == ESP_OK) {
+        err = esp_flash_write(esp_flash_default_chip, &hdr, base, sizeof(hdr));
+    }
+    free(out);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "log snapshot failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    s_snap_seq = hdr.seq;
+    s_snap_next_slot ^= 1;
+    s_snap_written = written;
+    return true;
+}
+
+static bool logsnap_dirty(void)
+{
+    taskENTER_CRITICAL(&s_log_lock);
+    const bool dirty = s_log_written != s_snap_written;
+    taskEXIT_CRITICAL(&s_log_lock);
+    return dirty;
+}
+
+static void logsnap_shutdown(void)
+{
+    if (logsnap_dirty()) {
+        logsnap_write();
+    }
+}
+
+// Besides the regular interval, a warning or error line triggers a snapshot LOGSNAP_URGENT_DELAY_MS
+// later (so a burst is saved whole). That is bounded: up to LOGSNAP_URGENT_BURST in a row, then one
+// per LOGSNAP_URGENT_REFILL_MS, so a noisy fault cannot wear the flash.
+#define LOGSNAP_URGENT_DELAY_MS 3000u
+#define LOGSNAP_URGENT_BURST 4
+#define LOGSNAP_URGENT_REFILL_MS (10u * 60u * 1000u)
+
+static void logsnap_task(void *arg)
+{
+    uint32_t last_ms = esp_log_timestamp();
+    uint32_t refill_ms = last_ms;
+    int tokens = LOGSNAP_URGENT_BURST;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        const uint32_t now = esp_log_timestamp();
+        if ((uint32_t)(now - refill_ms) >= LOGSNAP_URGENT_REFILL_MS) {
+            refill_ms = now;
+            if (tokens < LOGSNAP_URGENT_BURST) {
+                tokens++;
+            }
+        }
+        if (!logsnap_dirty()) {
+            s_snap_urgent_ms = 0;
+            continue;
+        }
+        const bool due = (uint32_t)(now - last_ms) >= CONFIG_WYZE_LOG_SNAPSHOT_MINUTES * 60000u;
+        const uint32_t urgent_at = s_snap_urgent_ms;
+        const bool urgent = urgent_at && (uint32_t)(now - urgent_at) >= LOGSNAP_URGENT_DELAY_MS && tokens > 0;
+        if (due || urgent) {
+            s_snap_urgent_ms = 0;
+            if (logsnap_write()) {
+                last_ms = now;
+                if (urgent && !due) {
+                    tokens--;
+                }
+            }
+        }
+    }
+}
+
+static void logsnap_init(void)
+{
+    logsnap_load();
+    if (s_snap_ok) {
+        esp_register_shutdown_handler(logsnap_shutdown);
+        xTaskCreate(logsnap_task, "logsnap", 4096, NULL, 2, NULL);
+    }
+}
+#else
+static void logsnap_init(void) {}
+#endif
 
 // ---------------------------------------------------------------- config
 
@@ -145,6 +415,7 @@ typedef struct {
     char token[65];
     char wifi_ssid[33];
     char wifi_pass[65];
+    char setup_pass[64];  // password of the /setup page; never empty (see config_load)
 } bridge_config_t;
 
 static bridge_config_t s_cfg;
@@ -165,6 +436,7 @@ static void config_load(void)
     strlcpy(s_cfg.token, CONFIG_WYZE_BRIDGE_TOKEN, sizeof(s_cfg.token));
     strlcpy(s_cfg.wifi_ssid, CONFIG_WYZE_WIFI_SSID, sizeof(s_cfg.wifi_ssid));
     strlcpy(s_cfg.wifi_pass, CONFIG_WYZE_WIFI_PASS, sizeof(s_cfg.wifi_pass));
+    strlcpy(s_cfg.setup_pass, CONFIG_WYZE_SETUP_PASSWORD, sizeof(s_cfg.setup_pass));
     nvs_handle_t h;
     if (nvs_open("bridge", NVS_READONLY, &h) != ESP_OK) {
         return;
@@ -173,28 +445,59 @@ static void config_load(void)
     nvs_get_str_or(h, "token", s_cfg.token, sizeof(s_cfg.token), CONFIG_WYZE_BRIDGE_TOKEN);
     nvs_get_str_or(h, "wifi_ssid", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid), CONFIG_WYZE_WIFI_SSID);
     nvs_get_str_or(h, "wifi_pass", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), CONFIG_WYZE_WIFI_PASS);
+    // An empty stored value means "the built-in default" (that is how it is reset), so a changed
+    // default in a newer image still applies to boards that never chose their own.
+    char setup_pass[sizeof(s_cfg.setup_pass)];
+    size_t setup_len = sizeof(setup_pass);
+    if (nvs_get_str(h, "setup_pass", setup_pass, &setup_len) == ESP_OK && setup_pass[0]) {
+        strlcpy(s_cfg.setup_pass, setup_pass, sizeof(s_cfg.setup_pass));
+    }
     nvs_close(h);
 }
 
-static esp_err_t config_save(void)
+// 8-63 printable ASCII characters, none of them a leading or trailing space: the page sends it in
+// an HTTP header, which cannot carry anything else intact.
+static bool setup_pass_valid(const char *p)
+{
+    const size_t n = strlen(p);
+    if (n < 8 || n > 63 || p[0] == ' ' || p[n - 1] == ' ') {
+        return false;
+    }
+    for (; *p; p++) {
+        if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static esp_err_t config_save_cfg(const bridge_config_t *c)
 {
     nvs_handle_t h;
     ESP_RETURN_ON_ERROR(nvs_open("bridge", NVS_READWRITE, &h), TAG, "nvs_open");
-    esp_err_t err = nvs_set_str(h, "uri", s_cfg.uri);
+    esp_err_t err = nvs_set_str(h, "uri", c->uri);
     if (err == ESP_OK) {
-        err = nvs_set_str(h, "token", s_cfg.token);
+        err = nvs_set_str(h, "token", c->token);
     }
     if (err == ESP_OK) {
-        err = nvs_set_str(h, "wifi_ssid", s_cfg.wifi_ssid);
+        err = nvs_set_str(h, "wifi_ssid", c->wifi_ssid);
     }
     if (err == ESP_OK) {
-        err = nvs_set_str(h, "wifi_pass", s_cfg.wifi_pass);
+        err = nvs_set_str(h, "wifi_pass", c->wifi_pass);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, "setup_pass", strcmp(c->setup_pass, CONFIG_WYZE_SETUP_PASSWORD) == 0 ? "" : c->setup_pass);
     }
     if (err == ESP_OK) {
         err = nvs_commit(h);
     }
     nvs_close(h);
     return err;
+}
+
+static esp_err_t config_save(void)
+{
+    return config_save_cfg(&s_cfg);
 }
 
 // The public Kconfig default for the gateway URI. A build whose baked URI differs from it carries
@@ -326,9 +629,17 @@ static void console_setup(void)
         !prompt("Bridge token", s_cfg.token, sizeof(s_cfg.token), true, true) ||
         !prompt("WiFi SSID (used when Ethernet has no IP, \"-\" = off)", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid),
                 false, true) ||
-        !prompt("WiFi password", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), true, true)) {
+        !prompt("WiFi password", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass), true, true) ||
+        !prompt("Setup page password (8-63 characters, \"-\" = default)", s_cfg.setup_pass,
+                sizeof(s_cfg.setup_pass), true, true)) {
         s_cfg = saved;
         return;
+    }
+    if (s_cfg.setup_pass[0] == '\0') {
+        strlcpy(s_cfg.setup_pass, CONFIG_WYZE_SETUP_PASSWORD, sizeof(s_cfg.setup_pass));
+    } else if (!setup_pass_valid(s_cfg.setup_pass)) {
+        printf("The setup page password needs 8-63 printable characters; keeping the previous one.\n");
+        strlcpy(s_cfg.setup_pass, saved.setup_pass, sizeof(s_cfg.setup_pass));
     }
     if (s_cfg.wifi_ssid[0] == '\0') {
         s_cfg.wifi_pass[0] = '\0';  // no SSID: drop any stale password
@@ -387,11 +698,29 @@ static bool s_ws_bad_uri;
 static volatile bool s_gateway_seen;  // set on the first WebSocket CONNECTED; read by the main loop
 static volatile uint32_t s_frames_up, s_frames_down;
 
+// Sensor reports held while the gateway is unreachable (see to_gateway_task). Only
+// to_gateway_task touches s_alarms; the HTTP server just reads its counters.
+static alarm_buf_t s_alarms;
+static volatile uint32_t s_alarms_replayed;
+static sensor_table_t s_sensors;  // guarded by s_sensor_lock
+static SemaphoreHandle_t s_sensor_lock;
+// The WebSocket session: set on CONNECTED, cleared on DISCONNECTED/ERROR and by ws_stop().
+static volatile bool s_ws_up;
+static volatile uint32_t s_ws_up_ms;
+static char s_devname[24];  // wyze-bridge-xxxx: mDNS host name and setup access point name
+
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
 // ---------------------------------------------------------------- Ethernet / WiFi
 
 // Wi-Fi is (re)started from a one-shot esp_timer, never from a delay inside an event
 // handler: the default event loop is shared with lwIP/websocket/USB events. One-shot (not
 // periodic) and restarted on every arm so bursts of DISCONNECTED don't stack up.
+static bool setup_ap_active(void);
+
 #if HAS_WIFI
 #define WIFI_RETRY_US (5 * 1000000)
 #define WIFI_BOOT_GRACE_US (8 * 1000000)  // let Ethernet link + DHCP first at boot
@@ -406,7 +735,9 @@ static void wifi_retry_timer_cb(void *arg)
     // happens here rather than in net_event_handler: on the P4 esp_wifi_stop() is a blocking
     // RPC to the C6 and must not stall the shared default event loop.
     if (xEventGroupGetBits(s_events) & ETH_IP_BIT) {
-        if (s_wifi_running) {
+        // The setup access point shares the radio: it closes itself (setup_ap_timer_cb) once
+        // nobody has needed it for SETUP_AP_LINGER_US, and stops Wi-Fi then.
+        if (s_wifi_running && !setup_ap_active()) {
             ESP_LOGI(TAG, "wifi stopped (ethernet is primary)");
             esp_wifi_stop();
         }
@@ -429,6 +760,195 @@ static void wifi_arm(uint64_t delay_us)
     esp_timer_start_once(s_wifi_retry_timer, delay_us);  // MICROSECONDS, not ticks
 }
 #endif
+
+#if HAS_WIFI && CONFIG_WYZE_SETUP_AP && (!CONFIG_ESP_HOSTED || CONFIG_WYZE_SETUP_AP_HOSTED)
+#define HAS_SETUP_AP 1
+#else
+#define HAS_SETUP_AP 0
+#endif
+
+// Setup access point: the way in when a board has no working network. Opened
+//  - at once on a board with no Ethernet and no Wi-Fi SSID (nothing else could ever work), or
+//  - whenever neither Ethernet nor Wi-Fi has had an address for CONFIG_WYZE_SETUP_AP_AFTER_S
+//    seconds, at boot or later (no cable or DHCP, wrong Wi-Fi password, router gone, and no
+//    Wi-Fi fallback to catch a cable pulled later).
+// Join it and open http://192.168.4.1/setup. It stays up until a network has an address and
+// SETUP_AP_LINGER_US has passed, or, when there is no Wi-Fi SSID to fall back to, for
+// CONFIG_WYZE_SETUP_AP_MINUTES; having timed out with the network still down, it does not reopen
+// until a network has been seen again, so a dead cable cannot keep an open access point cycling.
+// Two esp_timers drive it (a periodic network check and a one-shot closer). Their callbacks run
+// in the one esp_timer task, which owns s_no_net_s and s_ap_armed; the state is volatile because
+// the event loop reads it while that task and the opener task change it.
+#if HAS_SETUP_AP
+#define SETUP_AP_LINGER_US (60 * 1000000LL)  // after a network is up, let a user mid-form finish
+#define SETUP_AP_CHECK_US (5 * 1000000LL)
+typedef enum { AP_OFF, AP_OPENING, AP_UP } setup_ap_state_t;
+static esp_timer_handle_t s_ap_timer;        // closes the access point
+static esp_timer_handle_t s_ap_watch_timer;  // notices that the network is gone
+static uint32_t s_no_net_s;                  // seconds without an address while the AP is off
+static bool s_ap_armed = true;               // false after a timeout with no network, until one is seen
+static volatile setup_ap_state_t s_ap_state;
+static bool s_ap_netif_ready;
+
+static void setup_ap_open(bool with_sta)
+{
+    wifi_config_t ap = {0};
+    strlcpy((char *)ap.ap.ssid, s_devname, sizeof(ap.ap.ssid));
+    ap.ap.ssid_len = strlen(s_devname);
+    ap.ap.channel = 1;  // a station connection takes precedence over this in APSTA mode
+    ap.ap.max_connection = 4;
+    const char *pw = CONFIG_WYZE_SETUP_AP_PASSWORD;
+    if (strlen(pw) >= 8) {
+        strlcpy((char *)ap.ap.password, pw, sizeof(ap.ap.password));
+        ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    } else {
+        if (pw[0]) {
+            ESP_LOGW(TAG, "WYZE_SETUP_AP_PASSWORD is shorter than 8 characters; the setup AP will be open");
+        }
+        ap.ap.authmode = WIFI_AUTH_OPEN;
+    }
+    esp_err_t err = esp_wifi_set_mode(with_sta ? WIFI_MODE_APSTA : WIFI_MODE_AP);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    }
+    if (err == ESP_OK && !with_sta) {
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not open the setup access point: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGW(TAG, "setup access point \"%s\" is up (%s): join it and open http://192.168.4.1/setup", s_devname,
+             ap.ap.authmode == WIFI_AUTH_OPEN ? "open" : "WPA2");
+}
+
+// Restarts the countdown to closing the access point, once a network is up.
+static void setup_ap_linger(void)
+{
+    if (s_ap_state == AP_UP) {
+        esp_timer_stop(s_ap_timer);
+        esp_timer_start_once(s_ap_timer, SETUP_AP_LINGER_US);
+    }
+}
+
+static void setup_ap_close(void)
+{
+    s_no_net_s = 0;
+    s_ap_armed = (xEventGroupGetBits(s_events) & (ETH_IP_BIT | WIFI_IP_BIT)) != 0;
+    s_ap_state = AP_OFF;
+    if (s_wifi_netif) {
+        esp_wifi_set_mode(WIFI_MODE_STA);  // back to the Wi-Fi fallback alone
+        if (xEventGroupGetBits(s_events) & ETH_IP_BIT) {
+            esp_wifi_stop();  // Ethernet is primary: the Wi-Fi fallback rests
+        }
+        ESP_LOGI(TAG, "setup access point closed");
+    } else {
+        esp_wifi_stop();
+        ESP_LOGI(TAG, "setup access point closed; power-cycle the board to open it again");
+    }
+}
+
+// Runs in the main task (no network configured at all) or in setup_ap_task.
+static void setup_ap_bring_up(void)
+{
+    if (!s_ap_netif_ready) {
+        if (!s_wifi_netif) {  // Wi-Fi was never initialised on this board (no SSID)
+            wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+            ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        }
+        esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+#if CONFIG_ESP_HOSTED
+        // As for the station in wifi_init(): the hosted port's create_default leaves the io
+        // driver unbound, so frames never reach lwIP. A failure only costs the access point.
+        if (!ap_netif || esp_netif_attach_wifi_ap(ap_netif) != ESP_OK) {
+            ESP_LOGW(TAG, "hosted wifi: could not attach the access point netif");
+        }
+#else
+        (void)ap_netif;
+#endif
+        s_ap_netif_ready = true;
+    }
+    setup_ap_open(s_wifi_netif != NULL);
+    s_ap_state = AP_UP;
+    if (!s_wifi_netif && CONFIG_WYZE_SETUP_AP_MINUTES > 0) {
+        esp_timer_stop(s_ap_timer);
+        esp_timer_start_once(s_ap_timer, CONFIG_WYZE_SETUP_AP_MINUTES * 60 * 1000000LL);
+    }
+    if (xEventGroupGetBits(s_events) & (ETH_IP_BIT | WIFI_IP_BIT)) {
+        setup_ap_linger();  // a network came up while the access point was opening
+    }
+}
+
+// esp_wifi_init() and friends need more stack than the esp_timer task has, so the timer only
+// starts this short-lived task.
+static void setup_ap_task(void *arg)
+{
+    setup_ap_bring_up();
+    vTaskDelete(NULL);
+}
+
+static void setup_ap_timer_cb(void *arg)
+{
+    if (s_ap_state == AP_UP) {
+        setup_ap_close();
+    }
+}
+
+static void setup_ap_watch_cb(void *arg)
+{
+    if (s_ap_state != AP_OFF) {
+        return;
+    }
+    if (xEventGroupGetBits(s_events) & (ETH_IP_BIT | WIFI_IP_BIT)) {
+        s_no_net_s = 0;
+        s_ap_armed = true;
+        return;
+    }
+    s_no_net_s += SETUP_AP_CHECK_US / 1000000;
+    if (!s_ap_armed || s_no_net_s < CONFIG_WYZE_SETUP_AP_AFTER_S) {
+        return;
+    }
+    ESP_LOGW(TAG, "no network address for %d s", CONFIG_WYZE_SETUP_AP_AFTER_S);
+    s_no_net_s = 0;
+    s_ap_state = AP_OPENING;
+    if (xTaskCreate(setup_ap_task, "setup_ap", 4096, NULL, 4, NULL) != pdPASS) {
+        s_ap_state = AP_OFF;
+        ESP_LOGE(TAG, "could not start the setup access point task");
+    }
+}
+
+static void setup_ap_timer_create(void)
+{
+    const esp_timer_create_args_t args = {.callback = setup_ap_timer_cb, .name = "setup-ap"};
+    ESP_ERROR_CHECK(esp_timer_create(&args, &s_ap_timer));
+}
+
+// Called from net_start() on every board that has some other way to get a network.
+static void setup_ap_watch(void)
+{
+    setup_ap_timer_create();
+    const esp_timer_create_args_t args = {.callback = setup_ap_watch_cb, .name = "setup-ap-watch"};
+    ESP_ERROR_CHECK(esp_timer_create(&args, &s_ap_watch_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(s_ap_watch_timer, SETUP_AP_CHECK_US));
+}
+
+// No Ethernet and no SSID: the access point is the only way in.
+static void setup_ap_start_unconfigured(void)
+{
+    setup_ap_timer_create();
+    ESP_LOGW(TAG, "no ethernet and no wifi network configured");
+    setup_ap_bring_up();
+}
+#endif
+
+static bool setup_ap_active(void)
+{
+#if HAS_SETUP_AP
+    return s_ap_state == AP_UP;
+#else
+    return false;
+#endif
+}
 
 static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -458,6 +978,9 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "network up (ethernet), IP " IPSTR, IP2STR(&ev->ip_info.ip));
         xEventGroupSetBits(s_events, ETH_IP_BIT);
+#if HAS_SETUP_AP
+        setup_ap_linger();
+#endif
 #if HAS_WIFI
         wifi_arm(WIFI_STOP_US);  // replaces any pending start; stops Wi-Fi if it is running
 #endif
@@ -488,6 +1011,9 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t id, void
         } else {
             ESP_LOGW(TAG, "network up (wifi), IP " IPSTR, IP2STR(&ev->ip_info.ip));
             xEventGroupSetBits(s_events, WIFI_IP_BIT);
+#if HAS_SETUP_AP
+            setup_ap_linger();
+#endif
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
         xEventGroupClearBits(s_events, WIFI_IP_BIT);
@@ -625,12 +1151,22 @@ static void net_start(void)
     ESP_ERROR_CHECK(esp_netif_init());
     bool have_eth = eth_start();
     wifi_init(have_eth);
+#if HAS_SETUP_AP
+    if (!have_eth && !s_wifi_netif) {
+        setup_ap_start_unconfigured();
+    } else {
+        setup_ap_watch();
+    }
+#else
     if (!have_eth && !s_wifi_netif) {
         ESP_LOGE(TAG, "no ethernet and no wifi SSID configured: set one on the console");
     }
+#endif
 }
 
-// Ethernet wins whenever it has an address.
+// Ethernet wins whenever it has an address. Which network carries traffic (and whether the setup
+// access point opens) is decided only by link state and addresses, never by the gateway: a gateway
+// that is down or unreachable must not make the board swap interfaces or open the access point.
 static net_kind_t net_active(void)
 {
     EventBits_t bits = xEventGroupGetBits(s_events);
@@ -894,6 +1430,8 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "gateway connected");
+        s_ws_up_ms = (uint32_t)now_ms();
+        s_ws_up = true;
         s_gateway_seen = true;  // the main loop confirms a new OTA image (ota_confirm_poll)
         // Frames queued during the gap belong to the old session: drop them both ways.
         xQueueReset(s_to_dongle_q);
@@ -902,6 +1440,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         break;
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "gateway disconnected");
+        s_ws_up = false;
         break;
     case WEBSOCKET_EVENT_DATA:
         // Each WebSocket frame arrives as one or more chunks (payload_offset/data_len within
@@ -935,6 +1474,7 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         break;
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGW(TAG, "gateway connection error");
+        s_ws_up = false;
         break;
     default:
         break;
@@ -982,6 +1522,7 @@ static void ws_stop(void)
     }
     // Unpublish under the lock: once it is held no other task is using the client, and
     // afterwards none can pick it up, so destroying it outside the lock is safe.
+    s_ws_up = false;
     xSemaphoreTake(s_ws_lock, portMAX_DELAY);
     esp_websocket_client_handle_t ws = s_ws;
     s_ws = NULL;
@@ -991,22 +1532,86 @@ static void ws_stop(void)
     ESP_LOGI(TAG, "gateway connection closed");
 }
 
+// While the gateway is unreachable (network down, gateway restarting, link switching) the dongle
+// keeps hearing its sensors. Their state-change reports (alarm and leak, see wyze_proto.h) are
+// held here, up to ALARM_BUF_CAP of them, and replayed oldest first once the link is back. The
+// report carries the dongle's own timestamp, so the gateway still sees when it happened. Every
+// other frame (handshake answers, heartbeats) is only meaningful live and is dropped as before.
+static void sensor_report_cb(const wyze_event_t *ev, void *ctx)
+{
+    xSemaphoreTake(s_sensor_lock, portMAX_DELAY);
+    sensor_table_update(&s_sensors, ev, now_ms());
+    xSemaphoreGive(s_sensor_lock);
+}
+
+static void hold_report_cb(const wyze_event_t *ev, void *ctx)
+{
+    if (wyze_event_replayable(ev->event_type) && alarm_buf_push(&s_alarms, ev->pkt, ev->pkt_len, now_ms())) {
+        ESP_LOGW(TAG, "gateway not ready: holding %s report from %s (%u held)",
+                 ev->event_type == WYZE_EVENT_LEAK ? "leak" : "alarm", ev->mac, (unsigned)s_alarms.count);
+    }
+}
+
+// The gateway redoes its dongle handshake on every connection, so held reports are only
+// replayed once the session has been up for CONFIG_WYZE_ALARM_REPLAY_DELAY_S.
+static bool replay_ready(void)
+{
+    return s_ws_up && (uint32_t)(now_ms() - s_ws_up_ms) >= CONFIG_WYZE_ALARM_REPLAY_DELAY_S * 1000u;
+}
+
+static void replay_held_alarms(void)
+{
+    const uint32_t max_age_ms = CONFIG_WYZE_ALARM_MAX_AGE_S * 1000u;
+    unsigned sent = 0;
+    const alarm_entry_t *e;
+    while (replay_ready() && (e = alarm_buf_oldest(&s_alarms, now_ms(), max_age_ms)) != NULL) {
+        xSemaphoreTake(s_ws_lock, portMAX_DELAY);
+        const bool ok = s_ws && esp_websocket_client_is_connected(s_ws) &&
+                        esp_websocket_client_send_bin(s_ws, (const char *)e->data, e->len, pdMS_TO_TICKS(1000)) >= 0;
+        xSemaphoreGive(s_ws_lock);
+        if (!ok) {
+            break;  // stays queued for the next attempt
+        }
+        alarm_buf_drop_oldest(&s_alarms);
+        s_frames_up++;
+        s_alarms_replayed++;
+        sent++;
+    }
+    if (sent) {
+        ESP_LOGI(TAG, "replayed %u held report(s) to the gateway, %u left", sent, (unsigned)s_alarms.count);
+    }
+}
+
 static void to_gateway_task(void *arg)
 {
     frame_t f;
     while (true) {
-        if (xQueueReceive(s_to_gateway_q, &f, portMAX_DELAY) != pdTRUE) {
+        const bool got = xQueueReceive(s_to_gateway_q, &f, pdMS_TO_TICKS(1000)) == pdTRUE;
+        replay_held_alarms();  // older reports first, so they stay ahead of anything newer
+        if (!got) {
             continue;
         }
+        bool alarm_only = false;
+        wyze_scan_frame(f.data, f.len, sensor_report_cb, NULL, &alarm_only);
+        if (!replay_ready() && (alarm_only || !s_ws_up)) {
+            // Gateway down, or just reconnected and still handshaking: keep the reports for later.
+            wyze_scan_frame(f.data, f.len, hold_report_cb, NULL, NULL);
+            continue;
+        }
+        bool sent = false;
         xSemaphoreTake(s_ws_lock, portMAX_DELAY);
         if (s_ws && esp_websocket_client_is_connected(s_ws)) {
             if (esp_websocket_client_send_bin(s_ws, (const char *)f.data, f.len, pdMS_TO_TICKS(1000)) < 0) {
                 ESP_LOGW(TAG, "send to gateway failed");
             } else {
                 s_frames_up++;
+                sent = true;
             }
         }
         xSemaphoreGive(s_ws_lock);
+        if (!sent) {
+            wyze_scan_frame(f.data, f.len, hold_report_cb, NULL, NULL);  // the link dropped under us
+        }
     }
 }
 
@@ -1057,18 +1662,10 @@ static bool ota_confirm_poll(net_kind_t net, int64_t *net_since_us)
 
 // ---------------------------------------------------------------- HTTP: status, log, OTA
 
-// Accepts the bridge token as "Authorization: Bearer <token>" or ?token=<token>.
-static bool http_authorized(httpd_req_t *req)
+// True when the request carries the bridge token as "Authorization: Bearer <token>" or ?token=<token>.
+// Only meaningful while a token is set (an empty one would match an empty guess).
+static bool request_has_token(httpd_req_t *req)
 {
-    if (!s_cfg.token[0]) {
-        // Open by default so a fresh flash can be updated before a token is set; builds with
-        // CONFIG_WYZE_REQUIRE_TOKEN refuse instead.
-#if CONFIG_WYZE_REQUIRE_TOKEN
-        return false;
-#else
-        return true;
-#endif
-    }
     char buf[96];
     if (httpd_req_get_hdr_value_str(req, "Authorization", buf, sizeof(buf)) == ESP_OK &&
         strncmp(buf, "Bearer ", 7) == 0 && token_equal(buf + 7, s_cfg.token)) {
@@ -1082,6 +1679,21 @@ static bool http_authorized(httpd_req_t *req)
     }
     url_decode(token);
     return token_equal(token, s_cfg.token);
+}
+
+// Accepts the bridge token as "Authorization: Bearer <token>" or ?token=<token>.
+static bool http_authorized(httpd_req_t *req)
+{
+    if (!s_cfg.token[0]) {
+        // Open by default so a fresh flash can be updated before a token is set; builds with
+        // CONFIG_WYZE_REQUIRE_TOKEN refuse instead.
+#if CONFIG_WYZE_REQUIRE_TOKEN
+        return false;
+#else
+        return true;
+#endif
+    }
+    return request_has_token(req);
 }
 
 // Rejects with 401. The request body is read and dropped first (up to 4 KB; for a larger one the
@@ -1107,11 +1719,6 @@ static esp_err_t http_unauthorized(httpd_req_t *req)
 
 static auth_limiter_t s_auth_limiter;  // only touched by the HTTP server task
 static int64_t s_open_route_last_ms = INT64_MIN / 2;
-
-static int64_t now_ms(void)
-{
-    return esp_timer_get_time() / 1000;
-}
 
 // Answers 429 and returns false when the route is hit more than about 4 times a second.
 static bool http_rate_ok(httpd_req_t *req)
@@ -1149,6 +1756,53 @@ static bool http_check_auth(httpd_req_t *req)
     return false;
 }
 
+static esp_err_t setup_reply(httpd_req_t *req, const char *status, const char *msg)
+{
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    return httpd_resp_sendstr(req, msg);
+}
+
+// ---- setup page password
+
+typedef enum { SETUP_NO_CREDENTIALS, SETUP_OK, SETUP_WRONG, SETUP_LOCKED } setup_auth_t;
+
+// The page is unlocked by the setup password, or by the bridge token (so someone who forgot the
+// password can still get in). Credentials arrive in the X-Setup-Password header (the page's own
+// script), in the form's "auth" field, or as the usual Bearer / ?token= bridge token. A request
+// with no credentials is not a guess; wrong ones share the token routes' lockout (auth_limiter_t).
+static setup_auth_t setup_authorize(httpd_req_t *req, const char *form_auth)
+{
+    uint32_t retry_s = 0;
+    if (auth_limiter_blocked(&s_auth_limiter, now_ms(), &retry_s)) {
+        return SETUP_LOCKED;
+    }
+    char hdr[96];
+    const char *given = form_auth;
+    if (httpd_req_get_hdr_value_str(req, "X-Setup-Password", hdr, sizeof(hdr)) == ESP_OK) {
+        given = hdr;
+    }
+    const bool bearer = s_cfg.token[0] && request_has_token(req);
+    if (!bearer && !(given && given[0])) {
+        return SETUP_NO_CREDENTIALS;
+    }
+    if (bearer || token_equal(given, s_cfg.setup_pass) || (s_cfg.token[0] && token_equal(given, s_cfg.token))) {
+        auth_limiter_ok(&s_auth_limiter);
+        return SETUP_OK;
+    }
+    auth_limiter_fail(&s_auth_limiter, now_ms(), CONFIG_WYZE_AUTH_MAX_FAILS);
+    ESP_LOGW(TAG, "setup page: wrong password");
+    return SETUP_WRONG;
+}
+
+static esp_err_t setup_auth_reply(httpd_req_t *req, setup_auth_t a)
+{
+    if (a == SETUP_LOCKED) {
+        return setup_reply(req, "429 Too Many Requests", "too many wrong passwords; try again later\n");
+    }
+    return setup_reply(req, "401 Unauthorized", a == SETUP_WRONG ? "wrong password\n" : "setup password required\n");
+}
+
 static esp_err_t status_get(httpd_req_t *req)
 {
     if (!http_rate_ok(req)) {
@@ -1170,28 +1824,37 @@ static esp_err_t status_get(httpd_req_t *req)
     // /status is served without auth. json_escape cannot introduce a "token=" substring
     // and escapes an embedded credential only where it already reads as one in the URI.
     log_redact_token(uri);
-    char body[1024];
+    char body[1280];
     snprintf(body, sizeof(body),
              "{\"board\":\"" BOARD_NAME "\",\"version\":\"%s\",\"built\":\"%s %s\",\"uptime_s\":%lld,\"reset_reason\":%d,"
              "\"ip\":\"" IPSTR "\",\"gateway\":\"%s\",\"dongle\":%s,\"gateway_connected\":%s,"
              "\"network\":\"%s\",\"ethernet_link\":%s,\"wifi_fallback\":%s,"
-             "\"frames_to_gateway\":%lu,\"frames_to_dongle\":%lu,\"free_heap\":%lu,\"partition\":\"%s\"}\n",
+             "\"frames_to_gateway\":%lu,\"frames_to_dongle\":%lu,\"free_heap\":%lu,\"partition\":\"%s\","
+             "\"alarms_held\":%u,\"alarms_replayed\":%lu,\"alarms_lost\":%lu}\n",
              app->version, app->date, app->time, esp_timer_get_time() / 1000000, esp_reset_reason(),
              IP2STR(&ip.ip), uri, s_dongle ? "true" : "false", ws_connected ? "true" : "false",
              net == NET_ETH ? "ethernet" : net == NET_WIFI ? "wifi" : "none", eth_link ? "true" : "false",
              s_wifi_netif ? "true" : "false",
              (unsigned long)s_frames_up,
              (unsigned long)s_frames_down, (unsigned long)esp_get_free_heap_size(),
-             esp_ota_get_running_partition()->label);
+             esp_ota_get_running_partition()->label, (unsigned)s_alarms.count, (unsigned long)s_alarms_replayed,
+             (unsigned long)(s_alarms.overwritten + s_alarms.expired));
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }
 
+// The log is behind the setup password (or the bridge token): it names sensors and addresses, and
+// it is shown on the setup page after unlocking, so it needs no page of its own.
 static esp_err_t log_get(httpd_req_t *req)
 {
     if (!http_rate_ok(req)) {
         return ESP_OK;
     }
+    const setup_auth_t auth = setup_authorize(req, NULL);
+    if (auth != SETUP_OK) {
+        return setup_auth_reply(req, auth);
+    }
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     // Streamed in small chunks, each copied under the (interrupt-masking) spinlock and sent
     // without it: no 48 KB allocation and no long critical section. Text that is overwritten
     // while the response is being sent is skipped, never sent garbled.
@@ -1201,6 +1864,12 @@ static esp_err_t log_get(httpd_req_t *req)
     taskEXIT_CRITICAL(&s_log_lock);
     uint64_t pos = end > LOG_BUF_SIZE ? end - LOG_BUF_SIZE : 0;
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    if (s_prev_len) {  // the run before the last restart (see "log tail that survives restarts")
+        if (httpd_resp_send_chunk(req, s_prev, s_prev_len) != ESP_OK ||
+            httpd_resp_send_chunk(req, LOG_RESTART_MARKER, sizeof(LOG_RESTART_MARKER) - 1) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
     while (pos < end) {
         size_t n;
         taskENTER_CRITICAL(&s_log_lock);
@@ -1310,10 +1979,249 @@ static esp_err_t reboot_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ---------------------------------------------------------------- HTTP: pages, sensors, setup
+
+extern const char index_html_start[] asm("_binary_index_html_start");
+extern const char setup_html_start[] asm("_binary_setup_html_start");
+
+static esp_err_t send_page(httpd_req_t *req, const char *html)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Content-Security-Policy",
+                       "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                       "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t index_get(httpd_req_t *req)
+{
+    return send_page(req, index_html_start);
+}
+
+static esp_err_t setup_page_get(httpd_req_t *req)
+{
+    return send_page(req, setup_html_start);
+}
+
+// Sensors the dongle has reported, as heard since boot. The values come off the radio as bytes,
+// so everything printed from them is escaped or numeric.
+static esp_err_t sensors_get(httpd_req_t *req)
+{
+    sensor_table_t snap;
+    xSemaphoreTake(s_sensor_lock, portMAX_DELAY);
+    snap = s_sensors;
+    xSemaphoreGive(s_sensor_lock);
+    const uint32_t now = (uint32_t)now_ms();
+    httpd_resp_set_type(req, "application/json");
+    if (httpd_resp_send_chunk(req, "[", 1) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    for (uint8_t i = 0; i < snap.n; i++) {
+        const sensor_info_t *x = &snap.s[i];
+        char mac[2 * sizeof(x->mac) + 8];
+        json_escape(mac, sizeof(mac), x->mac);
+        char batt[16] = "null", rssi[16] = "null";
+        if (x->has_signal) {
+            snprintf(batt, sizeof(batt), "%u", (unsigned)x->battery_raw * 125u / 4u);  // raw/32 V, in mV
+            snprintf(rssi, sizeof(rssi), "%d", x->rssi);
+        }
+        char row[200];
+        snprintf(row, sizeof(row),
+                 "%s{\"mac\":\"%s\",\"type\":\"%s\",\"state\":%s,\"battery_mv\":%s,\"rssi\":%s,\"age_s\":%lu}",
+                 i ? "," : "", mac, wyze_sensor_type_name(x->sensor_type),
+                 !x->has_state ? "null" : x->state ? "\"active\"" : "\"inactive\"", batt, rssi,
+                 (unsigned long)((uint32_t)(now - x->last_ms) / 1000));
+        if (httpd_resp_send_chunk(req, row, HTTPD_RESP_USE_STRLEN) != ESP_OK) {
+            return ESP_FAIL;
+        }
+    }
+    if (httpd_resp_send_chunk(req, "]\n", 2) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+// A browser attaches Origin to cross-site form posts. Without this check any web page the user
+// opens could silently re-point an unprotected bridge at someone else's gateway. Clients that
+// send no Origin (curl, scripts) are not browsers and pass.
+static bool same_origin(httpd_req_t *req)
+{
+    char origin[96], host[64];
+    esp_err_t err = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK || httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        return false;
+    }
+    const char *h = strstr(origin, "://");
+    return h && strcasecmp(h + 3, host) == 0;
+}
+
+// Reads one urlencoded form field. Returns true if present and non-empty; *bad is set when the
+// value does not fit in out.
+static bool form_get(const char *body, const char *key, char *out, size_t size, bool *bad)
+{
+    out[0] = '\0';
+    const esp_err_t err = httpd_query_key_value(body, key, out, size);
+    if (err == ESP_ERR_NOT_FOUND) {
+        return false;
+    }
+    if (err != ESP_OK) {
+        out[0] = '\0';
+        *bad = true;
+        return false;
+    }
+    url_decode(out);
+    return out[0] != '\0';
+}
+
+static bool has_control_chars(const char *s)
+{
+    for (; *s; s++) {
+        if ((unsigned char)*s < 0x20 || *s == 0x7F) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Public: whether the password is still the default. With the setup password (X-Setup-Password
+// header), also what the form pre-fills. The tokens and Wi-Fi password never leave the board.
+static esp_err_t setup_json_get(httpd_req_t *req)
+{
+    const setup_auth_t a = setup_authorize(req, NULL);
+    if (a == SETUP_LOCKED || a == SETUP_WRONG) {
+        return setup_auth_reply(req, a);
+    }
+    char uri[2 * sizeof(s_cfg.uri)], ssid[2 * sizeof(s_cfg.wifi_ssid)];
+    json_escape(uri, sizeof(uri), s_cfg.uri);
+    json_escape(ssid, sizeof(ssid), s_cfg.wifi_ssid);
+    char body[2 * sizeof(uri) + 2 * sizeof(ssid) + 160];
+    int n = snprintf(body, sizeof(body), "{\"pass_default\":%s,\"ap\":%s",
+                     strcmp(s_cfg.setup_pass, CONFIG_WYZE_SETUP_PASSWORD) == 0 ? "true" : "false",
+                     setup_ap_active() ? "true" : "false");
+    if (a == SETUP_OK) {
+        n += snprintf(body + n, sizeof(body) - n, ",\"unlocked\":true,\"uri\":\"%s\",\"ssid\":\"%s\"", uri, ssid);
+    }
+    snprintf(body + n, sizeof(body) - n, "}\n");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(req, body);
+}
+
+// Same rules as the console: a blank field keeps the stored value, "-" clears it.
+static esp_err_t setup_post(httpd_req_t *req)
+{
+    if (!same_origin(req)) {
+        return setup_reply(req, "403 Forbidden", "cross-site request refused\n");
+    }
+    if (req->content_len == 0 || req->content_len > 1000) {
+        return setup_reply(req, "400 Bad Request", "missing or oversized form\n");
+    }
+    char body[1024];
+    size_t got = 0;
+    while (got < req->content_len) {
+        const int n = httpd_req_recv(req, body + got, req->content_len - got);
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (n <= 0) {
+            return ESP_FAIL;
+        }
+        got += n;
+    }
+    body[got] = '\0';
+
+    char val[400];
+    bool bad = false;
+    form_get(body, "auth", val, sizeof(val), &bad);
+    const setup_auth_t auth = setup_authorize(req, val);
+    if (auth != SETUP_OK) {
+        return setup_auth_reply(req, auth);
+    }
+    if (ota_pending_verify()) {
+        // Saving reboots, and a reboot before the new image is confirmed rolls it back.
+        return setup_reply(req, "503 Service Unavailable",
+                           "running firmware is still on trial (confirmed once the gateway connects, at most "
+                           "5 min after the network is up); retry later\n");
+    }
+
+    bridge_config_t n = s_cfg;
+    bool changed = false;
+    if (form_get(body, "uri", val, sizeof(val), &bad)) {
+        if ((strncmp(val, "ws://", 5) != 0 && strncmp(val, "wss://", 6) != 0) || strlen(val) >= sizeof(n.uri) ||
+            has_control_chars(val)) {
+            return setup_reply(req, "400 Bad Request", "Gateway URI must start with ws:// or wss://\n");
+        }
+        strlcpy(n.uri, val, sizeof(n.uri));
+        changed = true;
+    }
+    if (form_get(body, "new_token", val, sizeof(val), &bad)) {
+        if (strlen(val) >= sizeof(n.token) || has_control_chars(val)) {
+            return setup_reply(req, "400 Bad Request", "Bridge token must be at most 64 characters\n");
+        }
+        strlcpy(n.token, strcmp(val, "-") == 0 ? "" : val, sizeof(n.token));
+        changed = true;
+    }
+    if (form_get(body, "ssid", val, sizeof(val), &bad)) {
+        if (strlen(val) >= sizeof(n.wifi_ssid) || has_control_chars(val)) {
+            return setup_reply(req, "400 Bad Request", "Wi-Fi SSID must be at most 32 characters\n");
+        }
+        if (strcmp(val, "-") == 0) {
+            n.wifi_ssid[0] = '\0';
+            n.wifi_pass[0] = '\0';
+        } else {
+            strlcpy(n.wifi_ssid, val, sizeof(n.wifi_ssid));
+        }
+        changed = true;
+    }
+    if (form_get(body, "wifi_pass", val, sizeof(val), &bad)) {
+        if (strcmp(val, "-") == 0) {
+            n.wifi_pass[0] = '\0';
+        } else if (strlen(val) < 8 || strlen(val) >= sizeof(n.wifi_pass) || has_control_chars(val)) {
+            return setup_reply(req, "400 Bad Request", "Wi-Fi password must be 8 to 64 characters\n");
+        } else {
+            strlcpy(n.wifi_pass, val, sizeof(n.wifi_pass));
+        }
+        changed = true;
+    }
+    if (form_get(body, "new_setup_pass", val, sizeof(val), &bad)) {
+        if (strcmp(val, "-") == 0) {
+            strlcpy(n.setup_pass, CONFIG_WYZE_SETUP_PASSWORD, sizeof(n.setup_pass));  // back to the default
+        } else if (!setup_pass_valid(val)) {
+            return setup_reply(req, "400 Bad Request",
+                               "Setup password must be 8 to 63 printable characters, without a leading or "
+                               "trailing space\n");
+        } else {
+            strlcpy(n.setup_pass, val, sizeof(n.setup_pass));
+        }
+        changed = true;
+    }
+    if (bad) {
+        return setup_reply(req, "400 Bad Request", "a field is too long\n");
+    }
+    if (!changed) {
+        return setup_reply(req, "200 OK", "Nothing to change.\n");
+    }
+    const esp_err_t err = config_save_cfg(&n);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "saving settings from the web page failed: %s", esp_err_to_name(err));
+        return setup_reply(req, "500 Internal Server Error", "could not save the settings\n");
+    }
+    ESP_LOGI(TAG, "settings saved from the web page; restarting");
+    setup_reply(req, "200 OK", "Saved. The bridge is restarting.\n");
+    xTaskCreate(restart_task, "restart", 2048, NULL, 5, NULL);
+    return ESP_OK;
+}
+
 static void http_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.stack_size = 6144;
+    cfg.stack_size = 8192;
+    cfg.max_uri_handlers = 16;
     cfg.recv_wait_timeout = 10;
     // Idle or slow clients cannot hold every socket: the least recently used one is closed.
     cfg.lru_purge_enable = true;
@@ -1321,7 +2229,11 @@ static void http_start(void)
     ESP_ERROR_CHECK(httpd_start(&server, &cfg));
     const httpd_uri_t routes[] = {
         {.uri = "/status", .method = HTTP_GET, .handler = status_get},
-        {.uri = "/", .method = HTTP_GET, .handler = status_get},
+        {.uri = "/", .method = HTTP_GET, .handler = index_get},
+        {.uri = "/sensors", .method = HTTP_GET, .handler = sensors_get},
+        {.uri = "/setup", .method = HTTP_GET, .handler = setup_page_get},
+        {.uri = "/setup", .method = HTTP_POST, .handler = setup_post},
+        {.uri = "/setup.json", .method = HTTP_GET, .handler = setup_json_get},
         {.uri = "/log", .method = HTTP_GET, .handler = log_get},
         {.uri = "/ota", .method = HTTP_POST, .handler = ota_post},
         {.uri = "/reboot", .method = HTTP_POST, .handler = reboot_post},
@@ -1333,10 +2245,51 @@ static void http_start(void)
 
 // ---------------------------------------------------------------- main
 
+static void mdns_setup(void)
+{
+    esp_err_t err = mdns_init();
+    if (err == ESP_OK) {
+        err = mdns_hostname_set(s_devname);
+    }
+    if (err == ESP_OK) {
+        err = mdns_instance_name_set("Wyze ESP bridge");
+    }
+    if (err == ESP_OK) {
+        mdns_txt_item_t txt[] = {
+            {"board", BOARD_NAME},
+            {"version", esp_app_get_description()->version},
+        };
+        err = mdns_service_add(NULL, "_http", "_tcp", 80, txt, sizeof(txt) / sizeof(txt[0]));
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS unavailable: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "mDNS: http://%s.local/", s_devname);
+    }
+}
+
+
+static const char *reset_reason_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON: return "power-on (or power lost)";
+    case ESP_RST_EXT: return "external reset pin";
+    case ESP_RST_SW: return "software restart";
+    case ESP_RST_PANIC: return "panic (crash)";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "other watchdog";
+    case ESP_RST_BROWNOUT: return "brownout (supply voltage dropped)";
+    default: return "other";
+    }
+}
+
 void app_main(void)
 {
     esp_log_set_vprintf(log_vprintf);
     ESP_LOGI(TAG, "wyze-esp-bridge %s (" BOARD_NAME ")", esp_app_get_description()->version);
+    logsnap_init();
+    ESP_LOGI(TAG, "reset reason: %s", reset_reason_name(esp_reset_reason()));
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1352,12 +2305,18 @@ void app_main(void)
     s_hid_driver_q = xQueueCreate(8, sizeof(hid_driver_msg_t));
     s_dongle_lock = xSemaphoreCreateMutex();
     s_ws_lock = xSemaphoreCreateMutex();
+    s_sensor_lock = xSemaphoreCreateMutex();
     s_to_gateway_q = xQueueCreate(16, sizeof(frame_t));
     s_to_dongle_q = xQueueCreate(16, sizeof(frame_t));
+
+    uint8_t mac[6];
+    ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
+    snprintf(s_devname, sizeof(s_devname), "wyze-bridge-%02x%02x", mac[4], mac[5]);
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     net_start();
     http_start();
+    mdns_setup();
     if (!s_cfg.token[0]) {
 #if CONFIG_WYZE_REQUIRE_TOKEN
         ESP_LOGW(TAG, "no bridge token set: /ota and /reboot are disabled until one is set on the console");
@@ -1378,7 +2337,7 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(hid_host_install(&hid_cfg));
     xTaskCreate(to_dongle_task, "to_dongle", 4096, NULL, 5, NULL);
-    xTaskCreate(to_gateway_task, "to_gateway", 4096, NULL, 5, NULL);
+    xTaskCreate(to_gateway_task, "to_gateway", 5120, NULL, 5, NULL);
     ESP_LOGI(TAG, "waiting for Wyze dongle");
 
     // Open the gateway connection only while the dongle is present and the network is up,

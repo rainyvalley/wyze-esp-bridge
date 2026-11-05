@@ -38,6 +38,17 @@ power when the board is powered from the "UART" port, so use a powered OTG hub i
   happens when the gateway is simply off.
 - Between attempts the board waits 5 to 10 s, a random time each start, so many boards do not retry in step.
 - `/status` shows which network is in use (`ethernet`, `wifi` or `none`) and its IP address.
+- **Sensor alarms wait for the gateway.** The dongle keeps hearing sensors while the network or the gateway is
+  down. The board holds up to 32 alarm/leak reports (heartbeats and climate readings repeat on their own and are
+  not held) and sends them oldest-first once the gateway has been connected for 10 s; each keeps the dongle's own
+  timestamp. Reports older than 10 min are dropped and a full buffer drops its oldest. `/status` shows
+  `alarms_held`, `alarms_replayed` and `alarms_lost`. Held alarms live in RAM, so a restart discards them.
+  Settings: `CONFIG_WYZE_ALARM_REPLAY_DELAY_S`, `CONFIG_WYZE_ALARM_MAX_AGE_S`.
+- **The board has a name.** It answers as `wyze-bridge-xxxx.local` (`xxxx` is the last two bytes of its MAC, also
+  in the boot log) and advertises an `_http._tcp` service, so you do not need its IP address.
+- **No network at all:** if neither Ethernet nor Wi-Fi has an address for 3 minutes (or at once on a board with no
+  Ethernet and no Wi-Fi name), the board opens its own setup Wi-Fi network. See
+  [Web page and setup](#web-page-and-setup).
 
 ## Quick start (ESP32-P4)
 
@@ -57,6 +68,8 @@ power when the board is powered from the "UART" port, so use a powered OTG hub i
    - **Gateway URI**, for example `ws://<gateway-ip>:8080/ws/bridge`. Do not put a password or token in it.
    - **Bridge token**, the same as the gateway's `bridge.auth_token`. Typing is hidden.
    - **Wi-Fi name and password.** Leave the name empty if you only use Ethernet.
+   - **Setup page password**, for the board's own `/setup` page (not the gateway). 8 to 63 characters;
+     Enter keeps it and `-` puts the default `wyzebridge` back. See [Web page and setup](#web-page-and-setup).
 
    At each prompt, Enter keeps the value in brackets and `-` clears it. If you do not answer for
    60 s, setup is cancelled and nothing is saved. The board then starts normally.
@@ -71,7 +84,8 @@ power when the board is powered from the "UART" port, so use a powered OTG hub i
    gateway connected
    ```
    Give it up to 30 s. The dongle can take about 16 s to be found, and the board may unplug and replug
-   it once on its own. Replug it by hand only if nothing happens after 30 s.
+   it once on its own. Replug it by hand only if nothing happens after 30 s. On an Ethernet board, a
+   cable can leave too little room beside the USB-A port; a short USB-A extension cable fixes that.
 6. **Pair sensors** on the gateway's own web page (port 8080), as you would with a dongle on the gateway itself.
    The gateway sees this board as `device=esp32p4-eth` (or `esp32s3-eth`).
 
@@ -154,8 +168,8 @@ Without this, the release file starts with the placeholder gateway and never con
    curl -s http://<board-ip>/status   # new "version", the other "partition", "gateway_connected": true
    ```
 
-   `GET /log` shows `new firmware marked valid` once the new firmware is kept. Do not restart or unplug
-   the board before that, or it goes back to the old firmware.
+   The log on the setup page shows `new firmware marked valid` once the new firmware is kept. Do not restart
+   or unplug the board before that, or it goes back to the old firmware.
 
 | You see | It means | Do this |
 |---|---|---|
@@ -166,19 +180,112 @@ Without this, the release file starts with the placeholder gateway and never con
 | `400 missing or oversized image` | The upload is empty or the wrong file. | Use the `-ota.bin` file, not `-merged.bin`. |
 | `500 <error>` | The file was refused, for example wrong chip or damaged download. | Check the variant and the checksum. The running firmware is not changed. |
 
-If the board comes back on the old version, the new firmware was rolled back. Read `GET /log`.
+If the board comes back on the old version, the new firmware was rolled back. Read the log on the setup page.
 
 ### Web addresses on the board
 
-| Address | What it does | Token needed |
+| Address | What it does | Credential |
 |---|---|---|
-| `GET /status` | Shows the state as JSON. | no |
-| `GET /log` | Shows the log since the last restart (the last 48 KB). `token=` values are hidden. | no |
-| `POST /ota` | Installs a firmware file. | yes |
-| `POST /reboot` | Restarts the board. | yes |
+| `GET /` | The status page: network, gateway, dongle, held alarms and the sensors heard since boot. (It used to return the `/status` JSON.) | no |
+| `GET /status` | The same state as JSON. | no |
+| `GET /sensors` | The sensors heard since boot, as JSON. | no |
+| `GET /setup` | The settings page and the log. | setup password |
+| `GET /log` | The log as plain text (see [The log](#the-log)). | setup password or token |
+| `POST /setup` | Saves the settings from the page and restarts the board. | setup password |
+| `POST /ota` | Installs a firmware file. | token |
+| `POST /reboot` | Restarts the board. | token |
 
 The token goes in the `Authorization: Bearer` header. `?token=` in the address also works, with the
 token written in URL form (for example `%2B` for `+`). A header keeps the token out of addresses and logs.
+The setup password goes in the `X-Setup-Password` header (the page does that itself); the bridge token
+works there too.
+
+## Web page and setup
+
+`http://wyze-bridge-xxxx.local/` (or the board's IP) shows network, gateway, dongle, held alarms, and a
+table of the sensors the dongle has heard since boot: type, state, battery voltage, signal strength and
+time of the last report. The table is built from the reports passing through the bridge, so a sensor
+appears after its first report and the list starts empty after a restart.
+
+**Settings page (`/setup`).** Edits the same settings as the console prompts: gateway URI, bridge token,
+Wi-Fi name and password, and the setup password itself. It sits behind a **setup password**, `wyzebridge`
+until you change it: open the page, enter the password, and the form unlocks (nothing is shown before
+that). A blank field keeps the stored value and `-` clears it; for the setup password `-` puts the
+default back. Saving restarts the board. The board's [log](#the-log) is shown on the same page once it is
+unlocked.
+
+- **Changing it:** the "New setup password" box in the form, or the last console prompt. 8 to 63
+  printable ASCII characters, without a leading or trailing space. The page warns while the default is
+  still in use; since the default is published here, change it. It is stored on the board, survives
+  restarts and updates, and is never shown on any page or in `/status` or `/log`.
+- **It is not the bridge token.** The bridge token is the secret shared with the gateway. The two are
+  separate, but the bridge token also unlocks the page, so if you forget the setup password you can get
+  in with the token and set a new one (or enter `-` at the console prompt).
+- **Guessing is limited.** Wrong passwords count like wrong tokens: after 5 in a row the page answers
+  `429` for 30 s, doubling with each further wrong try up to 15 min. The same lock is shared with `/ota`
+  and `/reboot`.
+- **Plain HTTP:** the password crosses your network unencrypted, like the OTA token does.
+- Requests a browser marks as cross-site are refused, so a web page you happen to visit cannot
+  reconfigure the bridge. Like `/ota`, saving is refused while a fresh firmware image is still on trial.
+  Builds can change the default with `CONFIG_WYZE_SETUP_PASSWORD`. `CONFIG_WYZE_REQUIRE_TOKEN` applies to
+  `/ota` and `/reboot` only; the setup page is always behind its password.
+
+**Setup Wi-Fi network.** When a board has no working network it opens a Wi-Fi network named
+`wyze-bridge-xxxx` (the same `xxxx` as the mDNS name). Join it and open <http://192.168.4.1/setup> (the
+setup password unlocks the form). It opens
+
+- at once on a board with no Ethernet and no Wi-Fi name (the DevKitC-1 on first start), and
+- on any other board, including the S3-ETH PoE one, whenever neither Ethernet nor Wi-Fi has had an IP
+  address for 3 minutes, at boot or later: no cable or DHCP, a wrong Wi-Fi password, a router that is
+  gone. (A working Wi-Fi backup catches a pulled cable first, so the network only appears if that fails
+  too, or if no name is stored.) A router restart that long opens it as well. The Wi-Fi radio is started
+  for it even when no Wi-Fi name is stored.
+
+Once Ethernet or Wi-Fi gets an address the setup network stays up for another minute (so a form in
+progress finishes) and then closes. With no Wi-Fi name to fall back to, it also closes 30 minutes after
+opening and then stays closed until a network has been up again (on a board that never had one, until a
+power cycle), so a dead cable cannot keep it cycling. The network is open by default, so anyone in radio
+range can join it, but not change anything without the setup password; set `CONFIG_WYZE_SETUP_AP_PASSWORD`
+for a WPA2 network. On the ESP32-P4, whose Wi-Fi is the C6 co-processor, it is **experimental and off by
+default** (build with `CONFIG_WYZE_SETUP_AP_HOSTED=y`); without it those boards use `/setup` over
+Ethernet. With the flag, a P4 that has a stored Wi-Fi name but no working network adds the setup network
+next to its Wi-Fi attempts; one with no name at all has to start the C6 radio from scratch to open it.
+
+## The log
+
+The log is at the bottom of the `/setup` page once you unlock it (Refresh, or tick "every 5 s"); it has
+no page of its own, and it is behind the setup password because it names your sensors and addresses. It
+is the end of the log from before the last restart, a `--- restart ---` line, then this run's log, newest
+at the bottom. Times in it are seconds since that boot, not clock time.
+
+For scripts, `GET /log` returns the same text as plain text, with either credential:
+
+```bash
+curl -H "X-Setup-Password: <setup password>" http://<board-ip>/log
+curl -H "Authorization: Bearer <bridge token>" http://<board-ip>/log
+```
+
+- **Size:** this run's log is a 48 KB RAM buffer; the oldest text is overwritten when it fills.
+- **Repeats are collapsed.** A line that repeats on a loop (a gateway that is down is retried every 5 s,
+  and each attempt writes about seven lines) is written in full three times, then dropped, with one
+  `N repeats of "..."` note per message every 30 minutes. Without this, a single outage fills the buffer
+  in about 8 minutes and pushes everything useful out; with it, hours of outage cost a few KB. The same
+  applies to the serial console. A message that stops for a minute and comes back is logged in full
+  again.
+- **It survives restarts.** The tail of the log (up to 32 KB) is saved to flash at most every 20 minutes,
+  and only if the log changed, plus once on every restart the board starts itself (saving settings,
+  update, `/reboot`) and a few seconds after a warning or error line (4 in a row, then one per 10
+  minutes, so a fault cannot wear the flash). The first line of every boot names the reset reason
+  (power-on, crash, watchdog, brownout...). A power cut or a crash loses what was logged since the last
+  snapshot, which is why an incident log can end a few minutes early. History from several restarts is
+  kept in the same 32 KB, newest last.
+- **Where it lives:** the last 64 KB of the 16 MB flash, in two 32 KB slots written alternately so a power
+  cut mid-write leaves the other one intact. No partition uses that area, so updates are unaffected and
+  the partition table did not change. At boot the area is checked against the actual partition table and
+  a smaller flash; if either looks wrong nothing is written. Tunable with
+  `CONFIG_WYZE_LOG_SNAPSHOT_MINUTES`; `CONFIG_WYZE_LOG_PERSIST=n` turns it off.
+- **Secrets:** values of `token=` are masked before they reach the log or the snapshots, and no password
+  is ever logged.
 
 ## Security
 
@@ -186,14 +293,18 @@ token written in URL form (for example `%2B` for `+`). A header keeps the token 
   The token is sent in the clear. Use this on a network you trust.
 - **While no token is set, anyone on the network can use `/ota` and `/reboot`.** Set a token at setup.
   Or build with `CONFIG_WYZE_REQUIRE_TOKEN=y`, which refuses both until a token is set.
-- `/status` and `/log` need no token. They show the board's version, IP address, gateway address and log.
-- **Wrong tokens are limited.** After 5 wrong tokens in a row on `/ota` or `/reboot` (setting `CONFIG_WYZE_AUTH_MAX_FAILS`),
-  the board answers `429` for 30 s. Each further wrong try doubles the wait, up to 15 min. A correct token or a
-  restart clears it. The lock is shared by all clients, so someone guessing can also block you for a while.
-  `/status` and `/log` answer `429` if asked more than about 4 times a second.
+- `/`, `/status` and `/sensors` need no token: they show the board's version, IP address, gateway address
+  and sensors. `/log` needs the setup password (or the bridge token) because it names sensors and addresses.
+- **The setup page has its own password** (`wyzebridge` until you change it); the bridge token unlocks it
+  too. It is stored on the board and never shown on a page or in `/status` or `/log`.
+- **Wrong credentials are limited.** After 5 wrong tokens or setup passwords in a row on `/ota`,
+  `/reboot` or the setup page (setting `CONFIG_WYZE_AUTH_MAX_FAILS`), the board answers `429` for 30 s.
+  Each further wrong try doubles the wait, up to 15 min. A correct token or password, or a restart,
+  clears it. The lock is shared by all clients and all of those routes, so someone guessing can also
+  block you for a while. `/status` and `/log` answer `429` if asked more than about 4 times a second.
 - Put the token in the token field, not in the gateway URI. Only a `token=` in the URI is hidden in `/status` and `/log`.
-- The token and Wi-Fi password are saved on the board without encryption. Anyone who holds the board and its
-  serial port has full control of it.
+- The token, setup password and Wi-Fi password are saved on the board without encryption. Anyone who
+  holds the board and its serial port has full control of it.
 - Firmware files are not signed. The board accepts any valid image sent with the right token.
 
 ## Build from source
@@ -217,6 +328,10 @@ docker run --rm -v "$PWD":/project -w /project espressif/idf:release-v5.5 \
 
 Release files are built by CI with `./build.sh` in a pinned container image. Each release includes `SHA256SUMS`.
 
+`tests/host/` has host unit tests for the pure helpers: the dongle packet scanner, the alarm ring and
+sensor table, the log handling, and `main/util.c`. They need no ESP-IDF and no board; CI runs them
+before every build (see the `tests` job in `.github/workflows/release.yml`).
+
 To build in your own settings (gateway address, token, Wi-Fi), put them in a file named
 `sdkconfig.local.defaults`. Git ignores it, and `build.sh` adds it when it exists. Such an image
 contains those secrets as plain text, so never share it.
@@ -235,7 +350,11 @@ Maintainer notes, including the data flow and known pitfalls, are in [AGENTS.md]
 | `wifi disconnected (reason 201)` or `211` | The Wi-Fi network was not found. | Check the name and that it is 2.4 GHz. |
 | `esp-hosted fw versions ... major version mismatch` | The Wi-Fi chip on the P4 board has older factory firmware. | Nothing. Wi-Fi still works. |
 | `no gateway connection for 2 min, restarting the client` | The gateway has been unreachable for 2 minutes. | Check that the gateway is running and the URI and token are right. |
-| `GET /log` only shows lines since the last restart | The log is kept in memory only. | Nothing. It is not saved. |
+| `/setup` or `/log` asks for a password | Both are behind the setup page password; the bridge token works too. | Use `wyzebridge` until you change it, or `curl -H "X-Setup-Password: <password>"` for `/log`. |
+| Forgot the setup page password | The bridge token unlocks the page too. | Type the token in the password box and set a new password, or enter `-` at the console prompt. |
+| The setup Wi-Fi network did not appear | It needs 3 minutes without any address, and on the P4 it is off by default. | Look for `no network address` in the log; build with `CONFIG_WYZE_SETUP_AP_HOSTED=y` on the P4. |
+| The log is missing something from before a restart | The tail is saved only every 20 minutes and on restarts the board starts itself. | See [The log](#the-log); a power cut loses the last stretch. |
+| An alarm from during an outage never reached the gateway | Only alarm and leak reports are held, at most 32 and for 10 minutes, and only in RAM. | See [How it connects](#how-it-connects); `/status` shows `alarms_held`, `alarms_replayed` and `alarms_lost`. |
 
 ## Acknowledgments
 
@@ -248,8 +367,9 @@ Maintainer notes, including the data flow and known pitfalls, are in [AGENTS.md]
 ## Enclosure
 
 `case/wyze_esp_bridge_p4_case.scad` is a 3D-printable OpenSCAD case for the P4 board
-(60 x 74.3 x 27.1 mm, snap-fit or M2.5 screws). Previews are in `case/*.png`. The `.scad` file explains
-the print settings and the values marked `MEASURE`. `case/wyze_esp_bridge_case.scad` is the S3 board case.
+(60 x 74.3 x 27.1 mm, snap-fit or M2.5 screws). Previews are `case/p4-preview-*.png` (P4) and
+`case/s3-preview-*.png` (S3). The `.scad` file explains the print settings and the values marked
+`MEASURE`. `case/wyze_esp_bridge_case.scad` is the S3 board case.
 
 ## A note on AI assistance
 

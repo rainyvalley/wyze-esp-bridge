@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wyze ESP bridge setup</title>
+<style>
+:root{--bg:#fff;--fg:#1b1f23;--mut:#656d76;--line:#d0d7de;--card:#f6f8fa;--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700;--btn:#1f6feb}
+@media(prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--mut:#8b949e;--line:#30363d;--card:#161b22;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--btn:#388bfd}}
+*{box-sizing:border-box}
+body{margin:0 auto;max-width:32rem;padding:1rem;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
+h1{font-size:1.25rem;margin:0 0 1rem}fieldset{border:1px solid var(--line);border-radius:6px;margin:0 0 1rem;padding:.5rem .75rem .75rem}
+legend{padding:0 .25rem;color:var(--mut);font-size:.8rem;text-transform:uppercase;letter-spacing:.03em}
+label{display:block;margin-top:.6rem;font-weight:500}
+input{display:block;width:100%;margin-top:.2rem;padding:.5rem;border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit;font:inherit}
+small{display:block;color:var(--mut);margin-top:.2rem}
+button{padding:.6rem 1.2rem;border:0;border-radius:6px;background:var(--btn);color:#fff;font:inherit;cursor:pointer}
+button:disabled{opacity:.5}
+pre{margin:.5rem 0 0;padding:.5rem;max-height:26rem;overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--card);font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre}
+.row{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}.row label{display:flex;gap:.4rem;align-items:center;margin:0;font-weight:400}.row input{width:auto;margin:0}
+button.secondary{background:var(--card);color:var(--fg);border:1px solid var(--line)}
+#msg{margin-top:1rem}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+a{color:inherit}
+</style>
+</head>
+<body>
+<h1>Bridge setup</h1>
+<p id="notice" class="warn" hidden></p>
+
+<form id="login" autocomplete="off">
+  <fieldset>
+    <legend>Setup password</legend>
+    <label>Password<input name="pw" id="pw" type="password" autofocus></label>
+    <small id="login-hint">The bridge token also works.</small>
+  </fieldset>
+  <button id="unlock">Unlock</button>
+</form>
+
+<form id="f" autocomplete="off" hidden>
+  <p id="default-warn" class="warn" hidden>The setup password is still the default (wyzebridge). Choose a new one below.</p>
+  <fieldset>
+    <legend>Gateway</legend>
+    <label>Gateway URI<input name="uri" id="uri" placeholder="ws://192.168.1.50:8080/ws/bridge"></label>
+    <label>Bridge token<input name="new_token" type="password" placeholder="(unchanged)">
+      <small>The secret shared with the gateway (<code>bridge.auth_token</code>), not the setup password. Blank keeps the stored value, <code>-</code> clears it.</small></label>
+  </fieldset>
+  <fieldset>
+    <legend>Wi-Fi</legend>
+    <label>SSID<input name="ssid" id="ssid" placeholder="(none: Ethernet only)">
+      <small>Blank keeps the stored value, <code>-</code> turns Wi-Fi off.</small></label>
+    <label>Password<input name="wifi_pass" type="password" placeholder="(unchanged)"></label>
+  </fieldset>
+  <fieldset>
+    <legend>This page</legend>
+    <label>New setup password<input name="new_setup_pass" type="password" placeholder="(unchanged)">
+      <small>8&ndash;63 characters. Blank keeps the current one, <code>-</code> resets it to the default.</small></label>
+  </fieldset>
+  <button id="save">Save and restart</button>
+</form>
+<fieldset id="logbox" hidden>
+  <legend>Log</legend>
+  <div class="row">
+    <button type="button" id="log-refresh" class="secondary">Refresh</button>
+    <label><input type="checkbox" id="log-auto"> every 5 s</label>
+    <small id="log-info"></small>
+  </div>
+  <pre id="log" tabindex="0"></pre>
+</fieldset>
+<p id="msg" role="status"></p>
+<p><a href="/">&larr; Back to status</a></p>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let pw = '';
+function say(text, cls){ $('msg').textContent = text; $('msg').className = cls || ''; }
+
+fetch('/setup.json').then(r => r.json()).then(c => {
+  if (c.pass_default) $('login-hint').textContent = 'The default password is wyzebridge. The bridge token also works.';
+  if (c.ap) { const n = $('notice'); n.textContent = 'The bridge is offering its own setup Wi-Fi network.'; n.hidden = false; }
+}).catch(() => say('Could not reach the bridge.', 'bad'));
+
+$('login').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const p = $('pw').value;
+  $('unlock').disabled = true; say('');
+  try {
+    const r = await fetch('/setup.json', { headers: { 'X-Setup-Password': p } });
+    if (r.status === 429) say('Too many wrong passwords. Try again in a minute.', 'bad');
+    else if (!r.ok) say('Wrong password.', 'bad');
+    else {
+      const c = await r.json();
+      pw = p;
+      $('uri').value = c.uri; $('ssid').value = c.ssid;
+      $('default-warn').hidden = !c.pass_default;
+      $('login').hidden = true; $('f').hidden = false; $('logbox').hidden = false;
+      loadLog();
+    }
+  } catch (e) {
+    say('The password can only use plain keyboard characters (no accents or emoji).', 'bad');
+  }
+  $('unlock').disabled = false;
+});
+
+async function loadLog(){
+  const pre = $('log');
+  try {
+    const r = await fetch('/log', { headers: { 'X-Setup-Password': pw } });
+    if (!r.ok) { $('log-info').textContent = r.status === 429 ? 'Too many wrong passwords.' : 'Could not read the log (' + r.status + ').'; return; }
+    const t = await r.text();
+    const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
+    pre.textContent = t;
+    if (atEnd || !pre.dataset.shown) pre.scrollTop = pre.scrollHeight;  // follow the end unless scrolled up
+    pre.dataset.shown = '1';
+    $('log-info').textContent = Math.round(t.length / 1024) + ' KB, newest at the bottom';
+  } catch (e) { $('log-info').textContent = 'Could not read the log.'; }
+}
+$('log-refresh').addEventListener('click', loadLog);
+let logTimer = 0;
+$('log-auto').addEventListener('change', () => {
+  clearInterval(logTimer); logTimer = 0;
+  if ($('log-auto').checked) logTimer = setInterval(loadLog, 5000);
+});
+
+$('f').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  $('save').disabled = true; say('Saving…');
+  try {
+    const body = new URLSearchParams(new FormData($('f')));
+    body.set('auth', pw);
+    const r = await fetch('/setup', { method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    const t = (await r.text()).trim();
+    if (r.ok) say(t + ' If you changed Wi-Fi, rejoin your normal network and open the bridge again.', 'ok');
+    else { say(t || ('Error ' + r.status), 'bad'); $('save').disabled = false; }
+  } catch (e) { say('The bridge went away — it is probably restarting.', 'ok'); }
+});
+</script>
+</body>
+</html>
