@@ -3,7 +3,7 @@
 // The board sits on four standoffs and locates on their pins; the lid clips on (fixing = "clips").
 // With fixing = "screws", four M2.5 screws go lid -> tube -> PCB -> standoff and hold the lid too.
 // Front wall: stacked USB-A (dongle) / USB-C (power, console), RJ45 (PoE), TF card.
-// Left wall: RESET and BOOT button holes (press with a pin). Lid: PWR LED hole, vents over the PoE supply.
+// Left wall: RESET and BOOT button holes and the embossed label. Lid: PWR LED hole, vents over the PoE supply.
 //
 // Board frame: x = 0 at the left edge (buttons side), y = 0 at the connector edge, z = 0 at the PCB top.
 // Board positions come from Waveshare's dimension drawing and PCB layout. Values marked MEASURE are
@@ -29,9 +29,8 @@ conn_ovh = 1.75;         // connectors stick out past the PCB edge
 usb_x = 12.2;
 usba_w = 13.6;     // USB-A shell width
 usba_h = 7.0;      // USB-A shell height                                                    MEASURE
-usb_lift = 5.75;   // both USB openings sit this much higher than the first estimate       MEASURE
-usba_z0 = usb_lift; // USB-A shell bottom above the PCB top
-usbc_zc = -3.2 + usb_lift; // USB-C centre; the Type-A/C stack moves together
+usba_z0 = 7.0;     // USB-A opening sits directly on top of the USB-C opening            MEASURE
+usbc_zc = 3.0;     // USB-C opening centre: its bottom is level with the RJ45 opening
 usbc_open_w = 12.5; // opening for a USB-C plug's overmold
 usbc_open_h = 7.0;
 rj_x = 29.95;
@@ -80,6 +79,13 @@ fixing = "clips"; // [clips, screws]
 pin_d = 2.55;     // locating pin, fits the 2.7 mm board holes
 pin_extra = 0.4;  // how far the pin stands above the PCB top
 clamp = 0.1;      // clips: how far the lid boss presses into the PCB
+
+/* [Label] */
+label = true;
+label_text = "Wyze ESP Bridge";
+label_size = 5;
+label_font = "DejaVu Sans:style=Bold";   // change if your OpenSCAD lacks it
+label_emboss = 0.6;  // raised above the left wall
 
 $fn = 40;
 eps = 0.01;
@@ -170,6 +176,11 @@ module base() {
                     translate([0, 0, standoff_h]) cylinder(d = pin_d, h = pin_h + eps);
                 }
         }
+    // Embossed label on the outside of the left wall
+    if (label)
+        translate([0.2, out_d / 2, out_h / 2 + 3.5]) rotate([90, 0, -90])
+            linear_extrude(height = label_emboss + 0.2)
+                text(label_text, size = label_size, font = label_font, halign = "center", valign = "center");
 }
 
 // ------------------------------------------------------------------ lid (modelled in place, flipped for printing)
